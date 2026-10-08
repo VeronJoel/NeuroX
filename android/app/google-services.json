@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "493737465445",
+    "project_id": "urban-farming-ai",
+    "storage_bucket": "urban-farming-ai.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:493737465445:android:3119b0d922bb2adb0ad88c",
+        "android_client_info": {
+          "package_name": "com.example.urban_farming_ai"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCtaKT98_ybgvkV93TBKFc6i38jvIEXwo4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
