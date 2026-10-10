@@ -1,7 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+
+import '../services/app_language_service.dart';
 
 class IotSimulationPage extends StatefulWidget {
   const IotSimulationPage({super.key});
@@ -12,7 +17,6 @@ class IotSimulationPage extends StatefulWidget {
 
 class _IotSimulationPageState extends State<IotSimulationPage> {
   final Random _random = Random();
-
   Timer? _timer;
 
   double _soilMoisture = 58;
@@ -23,24 +27,37 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
 
   bool _autoMode = true;
   bool _pumpRunning = false;
+  bool _loadingWeather = false;
+  bool _usingLiveWeather = false;
 
   String _lastAction = 'System initialized';
+  String _locationName = 'Location not detected';
+  String _weatherMessage = 'Waiting for location permission';
+
+  DateTime? _weatherUpdatedAt;
+  Position? _position;
+
+  String _t(String key, String fallback) {
+    final translated = AppLanguageService.instance.translate(key);
+    return translated == key ? fallback : translated;
+  }
 
   @override
   void initState() {
     super.initState();
-
     _startSimulation();
+    _loadLocationAndWeather();
   }
 
   @override
   void dispose() {
     _timer?.cancel();
-
     super.dispose();
   }
 
   void _startSimulation() {
+    _timer?.cancel();
+
     _timer = Timer.periodic(const Duration(seconds: 3), (_) {
       if (!mounted) return;
 
@@ -54,55 +71,168 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
 
   void _simulateSensors() {
     setState(() {
-      _temperature += (_random.nextDouble() - 0.5) * 1.2;
+      // Temperature is updated from weather, not simulated here.
+      _humidity = (_humidity + (_random.nextDouble() - 0.5) * 2.5)
+          .clamp(30.0, 90.0)
+          .toDouble();
 
-      _humidity += (_random.nextDouble() - 0.5) * 2.5;
+      _light = (_light + (_random.nextDouble() - 0.5) * 5)
+          .clamp(0.0, 100.0)
+          .toDouble();
 
-      _light += (_random.nextDouble() - 0.5) * 5;
+      if (_pumpRunning && _waterTank > 0) {
+        _soilMoisture = (_soilMoisture + 3 + _random.nextDouble() * 2)
+            .clamp(0.0, 100.0)
+            .toDouble();
 
-      if (!_pumpRunning) {
-        _soilMoisture -= _random.nextDouble() * 1.4;
+        _waterTank = (_waterTank - 1 - _random.nextDouble() * 1.5)
+            .clamp(0.0, 100.0)
+            .toDouble();
       } else {
-        _soilMoisture += 3.0 + _random.nextDouble() * 2;
-
-        _waterTank -= 1.0 + _random.nextDouble() * 1.5;
+        _soilMoisture = (_soilMoisture - _random.nextDouble() * 1.4)
+            .clamp(0.0, 100.0)
+            .toDouble();
       }
 
-      _temperature = _temperature.clamp(20, 40);
-
-      _humidity = _humidity.clamp(30, 90);
-
-      _light = _light.clamp(0, 100);
-
-      _soilMoisture = _soilMoisture.clamp(0, 100);
-
-      _waterTank = _waterTank.clamp(0, 100);
-
-      if (_soilMoisture >= 85) {
-        _pumpRunning = false;
-      }
-
-      if (_waterTank <= 0) {
+      if (_waterTank <= 0 && _pumpRunning) {
         _pumpRunning = false;
         _lastAction = 'Water tank empty';
+      } else if (_pumpRunning && _soilMoisture >= 85) {
+        _pumpRunning = false;
+        _lastAction = 'Soil moisture reached target';
       }
     });
   }
 
+  Future<void> _loadLocationAndWeather() async {
+    if (_loadingWeather) return;
+
+    setState(() {
+      _loadingWeather = true;
+      _weatherMessage = 'Getting your location...';
+    });
+
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+
+      if (!serviceEnabled) {
+        throw Exception(
+          'Location services are disabled. Enable GPS and try again.',
+        );
+      }
+
+      LocationPermission permission = await Geolocator.checkPermission();
+
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+
+      if (permission == LocationPermission.denied) {
+        throw Exception(
+          'Location permission denied. Allow location access to get local weather.',
+        );
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        throw Exception(
+          'Location permission is permanently denied. Enable it in app settings.',
+        );
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+          timeLimit: Duration(seconds: 20),
+        ),
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        _position = position;
+        _locationName =
+            '${position.latitude.toStringAsFixed(3)}, '
+            '${position.longitude.toStringAsFixed(3)}';
+        _weatherMessage = 'Fetching local weather...';
+      });
+
+      await _fetchWeather(position.latitude, position.longitude);
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        _usingLiveWeather = false;
+        _weatherMessage = e.toString().replaceFirst('Exception: ', '');
+      });
+
+      _showMessage(_weatherMessage);
+    } finally {
+      if (mounted) {
+        setState(() => _loadingWeather = false);
+      }
+    }
+  }
+
+  Future<void> _fetchWeather(double latitude, double longitude) async {
+    try {
+      final uri = Uri.https('api.open-meteo.com', '/v1/forecast', {
+        'latitude': latitude.toString(),
+        'longitude': longitude.toString(),
+        'current': 'temperature_2m,relative_humidity_2m',
+        'timezone': 'auto',
+      });
+
+      final response = await http.get(uri).timeout(const Duration(seconds: 15));
+
+      if (response.statusCode != 200) {
+        throw Exception('Weather service returned an error.');
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final current = data['current'] as Map<String, dynamic>;
+
+      final temperature = (current['temperature_2m'] as num).toDouble();
+
+      final humidity = (current['relative_humidity_2m'] as num).toDouble();
+
+      if (!mounted) return;
+
+      setState(() {
+        _temperature = temperature;
+        _humidity = humidity;
+        _usingLiveWeather = true;
+        _weatherUpdatedAt = DateTime.now();
+        _weatherMessage = 'Live local weather';
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        _usingLiveWeather = false;
+        _weatherMessage = 'Weather unavailable. Check your internet and retry.';
+      });
+
+      _showMessage(_weatherMessage);
+    }
+  }
+
   void _runAutomaticIrrigation() {
+    if (!mounted) return;
+
     if (_soilMoisture < 35 && _waterTank > 5 && !_pumpRunning) {
       setState(() {
         _pumpRunning = true;
-
         _lastAction = 'Automatic irrigation started';
       });
-    }
-
-    if (_soilMoisture >= 75 && _pumpRunning) {
+    } else if (_soilMoisture >= 75 && _pumpRunning) {
       setState(() {
         _pumpRunning = false;
-
         _lastAction = 'Soil moisture reached target';
+      });
+    } else if (_waterTank <= 5 && _pumpRunning) {
+      setState(() {
+        _pumpRunning = false;
+        _lastAction = 'Water tank too low for irrigation';
       });
     }
   }
@@ -118,18 +248,18 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
         _lastAction = 'Automatic irrigation enabled';
       }
     });
+
+    if (value) _runAutomaticIrrigation();
   }
 
   void _togglePump() {
     if (_waterTank <= 0) {
-      _showMessage('Water tank is empty.');
-
+      _showMessage('Water tank is empty. Refill it first.');
       return;
     }
 
     setState(() {
       _pumpRunning = !_pumpRunning;
-
       _lastAction = _pumpRunning
           ? 'Manual irrigation started'
           : 'Manual irrigation stopped';
@@ -139,117 +269,96 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
   void _refillTank() {
     setState(() {
       _waterTank = 100;
-
       _lastAction = 'Water tank refilled';
     });
+
+    _showMessage('Water tank refilled.');
   }
 
   void _resetSystem() {
     setState(() {
       _soilMoisture = 58;
-      _temperature = 29;
       _humidity = 64;
       _light = 72;
       _waterTank = 76;
-
       _pumpRunning = false;
       _autoMode = true;
-
       _lastAction = 'System reset';
     });
+
+    // Keep the real weather temperature instead of resetting it
+    // to a fabricated value.
+    _showMessage('Simulation reset.');
   }
 
   void _showMessage(String message) {
+    if (!mounted) return;
+
     ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(message)));
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   String _soilStatus() {
-    if (_soilMoisture < 30) {
-      return 'Very Dry';
-    }
-
-    if (_soilMoisture < 45) {
-      return 'Dry';
-    }
-
-    if (_soilMoisture < 75) {
-      return 'Optimal';
-    }
-
-    if (_soilMoisture < 90) {
-      return 'Wet';
-    }
-
+    if (_soilMoisture < 30) return 'Very Dry';
+    if (_soilMoisture < 45) return 'Dry';
+    if (_soilMoisture < 75) return 'Optimal';
+    if (_soilMoisture < 90) return 'Wet';
     return 'Very Wet';
   }
 
   Color _soilColor() {
-    if (_soilMoisture < 30) {
-      return Colors.red;
-    }
-
-    if (_soilMoisture < 45) {
-      return Colors.orange;
-    }
-
-    if (_soilMoisture < 75) {
-      return Colors.green;
-    }
-
+    if (_soilMoisture < 30) return Colors.red;
+    if (_soilMoisture < 45) return Colors.orange;
+    if (_soilMoisture < 75) return Colors.green;
     return Colors.blue;
   }
 
   String _tankStatus() {
-    if (_waterTank <= 15) {
-      return 'Low';
-    }
-
-    if (_waterTank <= 40) {
-      return 'Medium';
-    }
-
+    if (_waterTank <= 15) return 'Low';
+    if (_waterTank <= 40) return 'Medium';
     return 'Good';
   }
 
   Color _tankColor() {
-    if (_waterTank <= 15) {
-      return Colors.red;
-    }
-
-    if (_waterTank <= 40) {
-      return Colors.orange;
-    }
-
+    if (_waterTank <= 15) return Colors.red;
+    if (_waterTank <= 40) return Colors.orange;
     return Colors.blue;
   }
 
   String _systemStatus() {
-    if (_waterTank <= 10) {
-      return 'Water Tank Critical';
-    }
-
-    if (_soilMoisture < 30) {
-      return 'Dry Soil';
-    }
-
-    if (_pumpRunning) {
-      return 'Irrigating';
-    }
-
-    return 'System Healthy';
+    if (_waterTank <= 10) return 'Water Tank Critical';
+    if (_soilMoisture < 30) return 'Dry Soil';
+    if (_pumpRunning) return 'Irrigating';
+    return 'Simulation Mode';
   }
 
   Color _systemColor() {
-    if (_waterTank <= 10 || _soilMoisture < 30) {
-      return Colors.red;
-    }
+    if (_waterTank <= 10 || _soilMoisture < 30) return Colors.red;
+    if (_pumpRunning) return Colors.blue;
+    return Colors.teal;
+  }
 
-    if (_pumpRunning) {
-      return Colors.blue;
-    }
-
-    return Colors.green;
+  Widget _sectionTitle(String title, {String? subtitle}) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+          ),
+          if (subtitle != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              subtitle,
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   Widget _buildHeader() {
@@ -259,37 +368,125 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: [Colors.teal.shade800, Colors.green.shade600],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
         ),
         borderRadius: BorderRadius.circular(24),
       ),
-      child: const Row(
+      child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('📡', style: TextStyle(fontSize: 38)),
-          SizedBox(width: 13),
+          const Text('📡', style: TextStyle(fontSize: 38)),
+          const SizedBox(width: 14),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Smart IoT Garden',
-                  style: TextStyle(
+                  _t('iot_smart_garden', 'Smart IoT Garden'),
+                  style: const TextStyle(
                     color: Colors.white,
-                    fontSize: 20,
+                    fontSize: 21,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
-                SizedBox(height: 5),
-                Text(
-                  'Simulated sensors demonstrate how smart farming automation can work.',
+                const SizedBox(height: 7),
+                const Text(
+                  'Local weather with simulated garden sensors '
+                  'and irrigation controls.',
                   style: TextStyle(
                     color: Colors.white70,
                     fontSize: 12,
-                    height: 1.4,
+                    height: 1.5,
                   ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.circle,
+                      size: 9,
+                      color: Colors.lightGreenAccent,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      _usingLiveWeather
+                          ? 'LIVE WEATHER CONNECTED'
+                          : 'SIMULATION ACTIVE',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLocationCard() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.teal.shade100),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.location_on, color: Colors.teal.shade700),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Your Location',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Refresh location and weather',
+                onPressed: _loadingWeather ? null : _loadLocationAndWeather,
+                icon: _loadingWeather
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.refresh),
+              ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          Text(
+            _locationName,
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            _weatherMessage,
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+          ),
+          if (_weatherUpdatedAt != null) ...[
+            const SizedBox(height: 5),
+            Text(
+              'Updated at ${_weatherUpdatedAt!.toLocal().toString().substring(11, 16)}',
+              style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+            ),
+          ],
+          const SizedBox(height: 8),
+          const Text(
+            'Temperature is from local outdoor weather data, '
+            'not a physical garden thermometer.',
+            style: TextStyle(fontSize: 11, color: Colors.grey),
           ),
         ],
       ),
@@ -317,7 +514,7 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
               shape: BoxShape.circle,
             ),
             child: Icon(
-              _pumpRunning ? Icons.water_drop : Icons.check_circle_outline,
+              _pumpRunning ? Icons.water_drop : Icons.sensors,
               color: color,
               size: 26,
             ),
@@ -327,11 +524,11 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
+                Text(
                   'System Status',
-                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
                 ),
-                const SizedBox(height: 3),
+                const SizedBox(height: 4),
                 Text(
                   _systemStatus(),
                   style: TextStyle(
@@ -340,80 +537,32 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
                     color: color,
                   ),
                 ),
+                const SizedBox(height: 3),
+                Text(
+                  _autoMode ? 'Automatic mode' : 'Manual mode',
+                  style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                ),
               ],
             ),
           ),
           if (_pumpRunning)
-            const Text(
-              'PUMP ON',
-              style: TextStyle(
-                color: Colors.blue,
-                fontSize: 10,
-                fontWeight: FontWeight.bold,
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.blue.shade50,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Text(
+                'PUMP ON',
+                style: TextStyle(
+                  color: Colors.blue,
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
         ],
       ),
-    );
-  }
-
-  Widget _buildSensorGrid() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          'Live Sensors',
-          style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: _sensorCard(
-                icon: Icons.water_drop_outlined,
-                title: 'Soil Moisture',
-                value: '${_soilMoisture.toStringAsFixed(0)}%',
-                status: _soilStatus(),
-                color: _soilColor(),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: _sensorCard(
-                icon: Icons.thermostat_outlined,
-                title: 'Temperature',
-                value: '${_temperature.toStringAsFixed(1)}°C',
-                status: 'Live',
-                color: Colors.orange,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 10),
-        Row(
-          children: [
-            Expanded(
-              child: _sensorCard(
-                icon: Icons.water_outlined,
-                title: 'Humidity',
-                value: '${_humidity.toStringAsFixed(0)}%',
-                status: 'Live',
-                color: Colors.blue,
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: _sensorCard(
-                icon: Icons.wb_sunny_outlined,
-                title: 'Light',
-                value: '${_light.toStringAsFixed(0)}%',
-                status: 'Live',
-                color: Colors.amber.shade700,
-              ),
-            ),
-          ],
-        ),
-      ],
     );
   }
 
@@ -423,39 +572,58 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
     required String value,
     required String status,
     required Color color,
+    required double progress,
   }) {
     return Container(
-      padding: const EdgeInsets.all(15),
+      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(18),
         border: Border.all(color: color.withOpacity(0.18)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Container(
-            width: 40,
-            height: 40,
+            width: 39,
+            height: 39,
             decoration: BoxDecoration(
               color: color.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(13),
+              borderRadius: BorderRadius.circular(12),
             ),
             child: Icon(icon, color: color, size: 21),
           ),
-          const SizedBox(height: 11),
+          const SizedBox(height: 12),
           Text(
             title,
-            style: TextStyle(color: Colors.grey.shade600, fontSize: 10),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: Colors.grey.shade600, fontSize: 11),
           ),
-          const SizedBox(height: 3),
-          Text(
-            value,
-            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          const SizedBox(height: 4),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              value,
+              style: const TextStyle(fontSize: 23, fontWeight: FontWeight.bold),
+            ),
           ),
-          const SizedBox(height: 3),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: LinearProgressIndicator(
+              value: progress.clamp(0.0, 1.0).toDouble(),
+              minHeight: 5,
+              backgroundColor: color.withOpacity(0.1),
+              valueColor: AlwaysStoppedAnimation<Color>(color),
+            ),
+          ),
+          const SizedBox(height: 8),
           Text(
             status,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: color,
               fontSize: 10,
@@ -467,12 +635,78 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
     );
   }
 
+  Widget _buildSensorGrid() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = constraints.maxWidth >= 650 ? 4 : 2;
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _sectionTitle(
+              'Garden Readings',
+              subtitle: 'Weather is live; other sensor readings are simulated.',
+            ),
+            GridView.count(
+              crossAxisCount: columns,
+              crossAxisSpacing: 10,
+              mainAxisSpacing: 10,
+              childAspectRatio: columns == 4 ? 1.0 : 0.88,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              children: [
+                _sensorCard(
+                  icon: Icons.water_drop_outlined,
+                  title: 'Soil Moisture (Simulated)',
+                  value: '${_soilMoisture.toStringAsFixed(0)}%',
+                  status: _soilStatus(),
+                  color: _soilColor(),
+                  progress: _soilMoisture / 100,
+                ),
+                _sensorCard(
+                  icon: Icons.thermostat_outlined,
+                  title: 'Outdoor Temperature',
+                  value: _usingLiveWeather
+                      ? '${_temperature.toStringAsFixed(1)}°C'
+                      : '-- °C',
+                  status: _usingLiveWeather
+                      ? 'Live weather'
+                      : 'Weather unavailable',
+                  color: Colors.orange,
+                  progress: (_temperature / 50).clamp(0.0, 1.0),
+                ),
+                _sensorCard(
+                  icon: Icons.water_outlined,
+                  title: 'Humidity',
+                  value: '${_humidity.toStringAsFixed(0)}%',
+                  status: _usingLiveWeather
+                      ? 'Live outdoor humidity'
+                      : 'Simulated humidity',
+                  color: Colors.blue,
+                  progress: _humidity / 100,
+                ),
+                _sensorCard(
+                  icon: Icons.wb_sunny_outlined,
+                  title: 'Light (Simulated)',
+                  value: '${_light.toStringAsFixed(0)}%',
+                  status: _light < 25 ? 'Low light' : 'Simulated reading',
+                  color: Colors.amber.shade800,
+                  progress: _light / 100,
+                ),
+              ],
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Widget _buildWaterTank() {
     final color = _tankColor();
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(18),
+      padding: const EdgeInsets.all(17),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(20),
@@ -482,13 +716,13 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
         children: [
           SizedBox(
             width: 64,
-            height: 80,
+            height: 90,
             child: Stack(
               alignment: Alignment.bottomCenter,
               children: [
                 Container(
                   width: 52,
-                  height: 72,
+                  height: 76,
                   decoration: BoxDecoration(
                     border: Border.all(color: Colors.blue.shade300, width: 2),
                     borderRadius: BorderRadius.circular(12),
@@ -497,19 +731,23 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
                 Positioned(
                   bottom: 2,
                   child: Container(
-                    width: 48,
-                    height: 68 * (_waterTank / 100),
+                    width: 46,
+                    height: 72 * (_waterTank / 100),
                     decoration: BoxDecoration(
                       color: Colors.blue.shade300,
                       borderRadius: BorderRadius.circular(9),
                     ),
                   ),
                 ),
-                Text(
-                  '${_waterTank.toStringAsFixed(0)}%',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.bold,
+                Positioned(
+                  bottom: 30,
+                  child: Text(
+                    '${_waterTank.toStringAsFixed(0)}%',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.black87,
+                    ),
                   ),
                 ),
               ],
@@ -521,10 +759,10 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'Water Tank',
+                  'Water Tank (Simulated)',
                   style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: 5),
                 Text(
                   _tankStatus(),
                   style: TextStyle(
@@ -533,9 +771,16 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
                     fontSize: 12,
                   ),
                 ),
-                const SizedBox(height: 5),
+                const SizedBox(height: 8),
+                LinearProgressIndicator(
+                  value: _waterTank / 100,
+                  minHeight: 5,
+                  backgroundColor: Colors.blue.shade50,
+                  valueColor: AlwaysStoppedAnimation<Color>(color),
+                ),
+                const SizedBox(height: 8),
                 Text(
-                  'Available water for automatic irrigation.',
+                  'Demo water level; no physical tank is connected.',
                   style: TextStyle(color: Colors.grey.shade600, fontSize: 11),
                 ),
               ],
@@ -564,7 +809,7 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text(
-            'Automation Controls',
+            'Simulation Controls',
             style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 8),
@@ -576,7 +821,7 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
             ),
             subtitle: Text(
               _autoMode
-                  ? 'Pump starts when soil becomes dry.'
+                  ? 'Demo pump starts when simulated soil becomes dry.'
                   : 'Manual control enabled.',
               style: const TextStyle(fontSize: 11),
             ),
@@ -598,7 +843,17 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
                     ? Colors.red
                     : Colors.blue.shade600,
                 foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
               ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: _resetSystem,
+              icon: const Icon(Icons.restart_alt),
+              label: const Text('Reset Simulation'),
             ),
           ),
         ],
@@ -617,20 +872,20 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.history, color: Colors.green.shade700, size: 20),
-          const SizedBox(width: 9),
+          Icon(Icons.history, color: Colors.green.shade700, size: 21),
+          const SizedBox(width: 10),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'Latest system activity',
+                  'Latest System Activity',
                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: 5),
                 Text(
                   _lastAction,
-                  style: TextStyle(color: Colors.grey.shade700, fontSize: 11),
+                  style: TextStyle(color: Colors.grey.shade700, fontSize: 12),
                 ),
               ],
             ),
@@ -656,33 +911,38 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
             'Future IoT Architecture',
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 6),
+          Text(
+            'Connect real sensors and a controller to replace simulated readings.',
+            style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+          ),
+          const SizedBox(height: 16),
           _architectureStep(
             '1',
             Icons.sensors_outlined,
             'Sensors',
-            'Soil moisture, temperature, humidity and light.',
+            'Measure actual soil moisture, temperature, humidity and light.',
           ),
           _architectureLine(),
           _architectureStep(
             '2',
             Icons.wifi,
             'Connectivity',
-            'ESP32 / Wi-Fi sends sensor readings.',
+            'An ESP32 or similar controller sends readings over Wi-Fi.',
           ),
           _architectureLine(),
           _architectureStep(
             '3',
             Icons.cloud_outlined,
             'Cloud + AI',
-            'Firebase and AI analyze garden conditions.',
+            'A backend can analyze readings and provide care guidance.',
           ),
           _architectureLine(),
           _architectureStep(
             '4',
             Icons.water_drop_outlined,
             'Automation',
-            'Pump activates when irrigation is required.',
+            'A controller can activate a real pump when irrigation is needed.',
           ),
         ],
       ),
@@ -717,7 +977,7 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
         ),
         const SizedBox(width: 10),
         Icon(icon, color: Colors.green.shade700, size: 21),
-        const SizedBox(width: 9),
+        const SizedBox(width: 10),
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -729,13 +989,13 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
                   fontSize: 13,
                 ),
               ),
-              const SizedBox(height: 3),
+              const SizedBox(height: 4),
               Text(
                 description,
                 style: TextStyle(
                   color: Colors.grey.shade600,
-                  fontSize: 10,
-                  height: 1.35,
+                  fontSize: 11,
+                  height: 1.4,
                 ),
               ),
             ],
@@ -747,8 +1007,8 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
 
   Widget _architectureLine() {
     return Container(
-      margin: const EdgeInsets.only(left: 15, top: 4, bottom: 4),
-      height: 12,
+      margin: const EdgeInsets.only(left: 15, top: 5, bottom: 5),
+      height: 14,
       width: 2,
       color: Colors.green.shade100,
     );
@@ -756,66 +1016,79 @@ class _IotSimulationPageState extends State<IotSimulationPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFFF6FAF5),
-      appBar: AppBar(
-        title: const Text(
-          'Smart IoT',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-        backgroundColor: const Color(0xFFF6FAF5),
-        elevation: 0,
-        actions: [
-          IconButton(
-            tooltip: 'Reset simulation',
-            onPressed: _resetSystem,
-            icon: const Icon(Icons.restart_alt),
+    return AnimatedBuilder(
+      animation: AppLanguageService.instance,
+      builder: (context, _) {
+        return Scaffold(
+          backgroundColor: const Color(0xFFF6FAF5),
+          appBar: AppBar(
+            title: Text(
+              _t('iot_smart_iot', 'Smart IoT'),
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            backgroundColor: const Color(0xFFF6FAF5),
+            elevation: 0,
+            actions: [
+              IconButton(
+                tooltip: 'Refresh location and weather',
+                onPressed: _loadingWeather ? null : _loadLocationAndWeather,
+                icon: const Icon(Icons.my_location),
+              ),
+              IconButton(
+                tooltip: 'Reset simulation',
+                onPressed: _resetSystem,
+                icon: const Icon(Icons.restart_alt),
+              ),
+            ],
           ),
-        ],
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(20, 10, 20, 35),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _buildHeader(),
-
-            const SizedBox(height: 18),
-
-            _buildSystemStatus(),
-
-            const SizedBox(height: 22),
-
-            _buildSensorGrid(),
-
-            const SizedBox(height: 22),
-
-            _buildWaterTank(),
-
-            const SizedBox(height: 22),
-
-            _buildControls(),
-
-            const SizedBox(height: 18),
-
-            _buildActivity(),
-
-            const SizedBox(height: 22),
-
-            _buildArchitectureCard(),
-
-            const SizedBox(height: 20),
-
-            const Center(
-              child: Text(
-                'Simulation only — physical sensors can be connected in a future version.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.grey, fontSize: 10),
+          body: SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 32),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 900),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _buildHeader(),
+                      const SizedBox(height: 18),
+                      _buildLocationCard(),
+                      const SizedBox(height: 18),
+                      _buildSystemStatus(),
+                      const SizedBox(height: 24),
+                      _buildSensorGrid(),
+                      const SizedBox(height: 24),
+                      _sectionTitle('Water Supply'),
+                      _buildWaterTank(),
+                      const SizedBox(height: 24),
+                      _buildControls(),
+                      const SizedBox(height: 18),
+                      _buildActivity(),
+                      const SizedBox(height: 24),
+                      _buildArchitectureCard(),
+                      const SizedBox(height: 20),
+                      const Center(
+                        child: Text(
+                          'Outdoor temperature and humidity come from '
+                          'weather data. Soil moisture, light, water tank '
+                          'and irrigation are simulated. No physical sensors '
+                          'or pumps are connected.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.grey,
+                            fontSize: 11,
+                            height: 1.5,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }

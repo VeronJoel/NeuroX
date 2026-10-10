@@ -4,7 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
-import 'add_plant_page.dart';
+import '../services/app_language_service.dart';
 import 'plant_detail_page.dart';
 import 'plant_scanner_page.dart';
 
@@ -17,57 +17,45 @@ class SmartAlertsPage extends StatefulWidget {
 
 class _SmartAlertsPageState extends State<SmartAlertsPage> {
   final FirebaseAuth _auth = FirebaseAuth.instance;
-
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final AppLanguageService _language = AppLanguageService.instance;
 
   bool _refreshing = false;
+  String _filter = 'All';
+
+  String _t(String key, String fallback) {
+    final translated = _language.translate(key);
+    return translated == key ? fallback : translated;
+  }
 
   CollectionReference<Map<String, dynamic>> get _plantsRef {
-    final uid = _auth.currentUser!.uid;
-
-    return _firestore.collection('users').doc(uid).collection('plants');
+    final user = _auth.currentUser;
+    return _firestore
+        .collection('users')
+        .doc(user?.uid ?? '_unauthenticated')
+        .collection('plants');
   }
 
   DateTime? _date(dynamic value) {
-    if (value is Timestamp) {
-      return value.toDate();
-    }
-
+    if (value is Timestamp) return value.toDate();
+    if (value is DateTime) return value;
     return null;
   }
 
   int _health(dynamic value) {
-    if (value is num) {
-      return value.toInt().clamp(0, 100);
-    }
-
+    if (value is num) return value.toInt().clamp(0, 100);
     return 100;
   }
 
-  List<String> _stringList(dynamic value) {
-    if (value is List) {
-      return value.map((item) => item.toString()).toList();
-    }
-
-    if (value is String && value.trim().isNotEmpty) {
-      return [value];
-    }
-
-    return [];
-  }
-
   Future<void> _refresh() async {
-    setState(() {
-      _refreshing = true;
-    });
+    if (_refreshing) return;
 
-    await Future.delayed(const Duration(milliseconds: 500));
+    setState(() => _refreshing = true);
+    await Future<void>.delayed(const Duration(milliseconds: 350));
 
-    if (!mounted) return;
-
-    setState(() {
-      _refreshing = false;
-    });
+    if (mounted) {
+      setState(() => _refreshing = false);
+    }
   }
 
   void _openPlant(String plantId) {
@@ -87,195 +75,183 @@ class _SmartAlertsPageState extends State<SmartAlertsPage> {
     );
   }
 
-  Future<void> _markWatered(String plantId) async {
+  Future<void> _markWatered(String plantId, Map<String, dynamic> data) async {
     try {
+      final user = _auth.currentUser;
+      if (user == null) return;
+
       final now = DateTime.now();
+      final rawInterval = data['wateringIntervalDays'];
+      final interval = rawInterval is num ? rawInterval.toInt() : 2;
 
-      final nextWatering = now.add(const Duration(days: 2));
+      final plantRef = _plantsRef.doc(plantId);
+      final diaryRef = plantRef.collection('diary').doc();
+      final activityRef = _firestore
+          .collection('users')
+          .doc(user.uid)
+          .collection('activity')
+          .doc();
 
-      await _plantsRef.doc(plantId).update({
+      final batch = _firestore.batch();
+
+      batch.update(plantRef, {
         'lastWatered': Timestamp.fromDate(now),
-
-        'nextWatering': Timestamp.fromDate(nextWatering),
-
+        'nextWatering': Timestamp.fromDate(now.add(Duration(days: interval))),
         'updatedAt': FieldValue.serverTimestamp(),
       });
 
+      batch.set(diaryRef, {
+        'type': 'Watering',
+        'note': 'Plant watered from Smart Alerts',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      batch.set(activityRef, {
+        'type': 'watering',
+        'plantId': plantId,
+        'plantName': data['name']?.toString() ?? 'Plant',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      await batch.commit();
+
       if (!mounted) return;
 
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Plant marked as watered 💧')),
+        SnackBar(
+          content: Text(
+            _t('plant_marked_watered', 'Plant marked as watered 💧'),
+          ),
+        ),
       );
-    } catch (e) {
+    } catch (error) {
       if (!mounted) return;
 
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not update watering status: $e')),
+        SnackBar(
+          content: Text(
+            '${_t('watering_update_failed', 'Could not update watering')}: $error',
+          ),
+        ),
       );
     }
-  }
-
-  Future<void> _scanAllPlants(
-    List<QueryDocumentSnapshot<Map<String, dynamic>>> plants,
-  ) async {
-    if (plants.isEmpty) {
-      return;
-    }
-
-    final firstPlant = plants.first;
-
-    final data = firstPlant.data();
-
-    _scanPlant(firstPlant.id, data['name']?.toString() ?? 'Plant');
   }
 
   List<_GardenAlert> _buildAlerts(
     List<QueryDocumentSnapshot<Map<String, dynamic>>> plants,
   ) {
     final alerts = <_GardenAlert>[];
-
     final now = DateTime.now();
 
     for (final plant in plants) {
       final data = plant.data();
-
       final plantId = plant.id;
-
       final name = data['name']?.toString() ?? 'Unnamed Plant';
-
       final health = _health(data['healthScore']);
-
-      final disease = data['diseaseStatus']?.toString().toLowerCase() ?? '';
-
-      final status = data['status']?.toString().toLowerCase() ?? '';
-
+      final status = (data['status'] ?? '').toString().toLowerCase();
+      final disease = (data['disease'] ?? data['diseaseStatus'] ?? '')
+          .toString()
+          .trim();
+      final diseaseLower = disease.toLowerCase();
       final nextWatering = _date(data['nextWatering']);
-
       final lastScan = _date(data['lastScanAt']);
-
       final needsRescan = data['needsRescan'] == true;
-
       final imageBase64 = data['imageBase64']?.toString() ?? '';
 
-      // ----------------------------------------------------------
-      // CRITICAL HEALTH
-      // ----------------------------------------------------------
-
-      if (health < 40) {
+      if (health < 40 || status == 'critical') {
         alerts.add(
           _GardenAlert(
-            id: '${plantId}_critical_health',
-
+            id: '${plantId}_critical',
             plantId: plantId,
-
             plantName: name,
-
-            title: '$name needs urgent attention',
-
-            message: 'Health score is only $health/100.',
-
-            priority: AlertPriority.critical,
-
+            title: _t(
+              'plant_urgent_attention',
+              '{plant} needs urgent attention',
+            ).replaceAll('{plant}', name),
+            message: _t(
+              'plant_health_score',
+              'Current plant health score: {score}/100.',
+            ).replaceAll('{score}', '$health'),
+            priority: _AlertPriority.critical,
             icon: Icons.health_and_safety_outlined,
-
             imageBase64: imageBase64,
-
-            action: AlertAction.viewPlant,
+            action: _AlertAction.view,
           ),
         );
-      }
-      // ----------------------------------------------------------
-      // LOW HEALTH
-      // ----------------------------------------------------------
-      else if (health < 70) {
+      } else if (health < 70 ||
+          status.contains('attention') ||
+          status == 'unhealthy') {
         alerts.add(
           _GardenAlert(
-            id: '${plantId}_low_health',
-
+            id: '${plantId}_health',
             plantId: plantId,
-
             plantName: name,
-
-            title: '$name needs attention',
-
-            message: 'Current health score is $health/100.',
-
-            priority: AlertPriority.warning,
-
-            icon: Icons.warning_amber_outlined,
-
+            title: _t(
+              'plant_needs_care',
+              '{plant} needs some care',
+            ).replaceAll('{plant}', name),
+            message: _t(
+              'plant_health_score',
+              'Current plant health score: {score}/100.',
+            ).replaceAll('{score}', '$health'),
+            priority: _AlertPriority.warning,
+            icon: Icons.warning_amber_rounded,
             imageBase64: imageBase64,
-
-            action: AlertAction.viewPlant,
+            action: _AlertAction.view,
           ),
         );
       }
-
-      // ----------------------------------------------------------
-      // DISEASE
-      // ----------------------------------------------------------
 
       if (disease.isNotEmpty &&
-          disease != 'healthy' &&
-          disease != 'none' &&
-          disease != 'unknown' &&
-          disease != 'unclear') {
+          diseaseLower != 'none' &&
+          diseaseLower != 'healthy' &&
+          diseaseLower != 'unknown' &&
+          diseaseLower != 'unclear' &&
+          diseaseLower != 'no disease detected') {
         alerts.add(
           _GardenAlert(
             id: '${plantId}_disease',
-
             plantId: plantId,
-
             plantName: name,
-
-            title: 'Possible issue detected on $name',
-
-            message: 'Latest AI diagnosis: ${data['diseaseStatus']}.',
-
+            title: _t(
+              'check_plant',
+              'Check {plant}',
+            ).replaceAll('{plant}', name),
+            message: _t(
+              'latest_diagnosis',
+              'Latest recorded diagnosis: {disease}.',
+            ).replaceAll('{disease}', disease),
             priority: health < 50
-                ? AlertPriority.critical
-                : AlertPriority.warning,
-
-            icon: Icons.coronavirus_outlined,
-
+                ? _AlertPriority.critical
+                : _AlertPriority.warning,
+            icon: Icons.biotech_outlined,
             imageBase64: imageBase64,
-
-            action: AlertAction.scan,
+            action: _AlertAction.scan,
           ),
         );
       }
-
-      // ----------------------------------------------------------
-      // RESCAN
-      // ----------------------------------------------------------
 
       if (needsRescan) {
         alerts.add(
           _GardenAlert(
             id: '${plantId}_rescan',
-
             plantId: plantId,
-
             plantName: name,
-
-            title: 'Time to rescan $name',
-
-            message: 'The previous AI diagnosis recommended another check.',
-
-            priority: AlertPriority.info,
-
+            title: _t(
+              'rescan_plant',
+              'Rescan {plant}',
+            ).replaceAll('{plant}', name),
+            message: _t(
+              'followup_health_check',
+              'A follow-up plant health check is recommended.',
+            ),
+            priority: _AlertPriority.info,
             icon: Icons.camera_alt_outlined,
-
             imageBase64: imageBase64,
-
-            action: AlertAction.scan,
+            action: _AlertAction.scan,
           ),
         );
       }
-
-      // ----------------------------------------------------------
-      // WATERING
-      // ----------------------------------------------------------
 
       if (nextWatering != null) {
         final difference = nextWatering.difference(now);
@@ -283,443 +259,300 @@ class _SmartAlertsPageState extends State<SmartAlertsPage> {
         if (difference.inMinutes <= 0) {
           alerts.add(
             _GardenAlert(
-              id: '${plantId}_watering_due',
-
+              id: '${plantId}_water_due',
               plantId: plantId,
-
               plantName: name,
-
-              title: '$name needs water',
-
-              message: 'Watering is due now.',
-
-              priority: AlertPriority.warning,
-
+              title: _t(
+                'plant_may_need_water',
+                '{plant} may need water',
+              ).replaceAll('{plant}', name),
+              message: _t(
+                'watering_time_arrived',
+                'Its scheduled watering time has arrived.',
+              ),
+              priority: _AlertPriority.warning,
               icon: Icons.water_drop_outlined,
-
               imageBase64: imageBase64,
-
-              action: AlertAction.water,
+              action: _AlertAction.water,
             ),
           );
         } else if (difference.inHours < 24) {
           alerts.add(
             _GardenAlert(
-              id: '${plantId}_watering_soon',
-
+              id: '${plantId}_water_soon',
               plantId: plantId,
-
               plantName: name,
-
-              title: '$name needs water soon',
-
-              message: 'Watering is due within ${difference.inHours} hours.',
-
-              priority: AlertPriority.info,
-
+              title: _t(
+                'water_plant_soon',
+                'Water {plant} soon',
+              ).replaceAll('{plant}', name),
+              message: _t(
+                'watering_within_24_hours',
+                'Its scheduled watering time is within 24 hours.',
+              ),
+              priority: _AlertPriority.info,
               icon: Icons.water_drop_outlined,
-
               imageBase64: imageBase64,
-
-              action: AlertAction.water,
+              action: _AlertAction.water,
             ),
           );
         }
       }
 
-      // ----------------------------------------------------------
-      // NEVER SCANNED
-      // ----------------------------------------------------------
-
       if (lastScan == null) {
         alerts.add(
           _GardenAlert(
             id: '${plantId}_first_scan',
-
             plantId: plantId,
-
             plantName: name,
-
-            title: 'Scan $name for a health baseline',
-
-            message: 'This plant has not been checked by AI yet.',
-
-            priority: AlertPriority.info,
-
-            icon: Icons.auto_awesome_outlined,
-
+            title: _t(
+              'check_plant_health',
+              'Check the health of {plant}',
+            ).replaceAll('{plant}', name),
+            message: _t(
+              'no_previous_scan',
+              'No previous AI scan date is recorded for this plant.',
+            ),
+            priority: _AlertPriority.info,
+            icon: Icons.center_focus_weak,
             imageBase64: imageBase64,
-
-            action: AlertAction.scan,
-          ),
-        );
-      }
-
-      // ----------------------------------------------------------
-      // CRITICAL STATUS
-      // ----------------------------------------------------------
-
-      if (status == 'critical' && health >= 40) {
-        alerts.add(
-          _GardenAlert(
-            id: '${plantId}_critical_status',
-
-            plantId: plantId,
-
-            plantName: name,
-
-            title: '$name is marked critical',
-
-            message: 'Review the latest diagnosis and treatment advice.',
-
-            priority: AlertPriority.critical,
-
-            icon: Icons.priority_high,
-
-            imageBase64: imageBase64,
-
-            action: AlertAction.viewPlant,
+            action: _AlertAction.scan,
           ),
         );
       }
     }
 
-    alerts.sort((a, b) => a.priority.index.compareTo(b.priority.index));
+    alerts.sort((a, b) {
+      final priorityOrder = a.priority.index.compareTo(b.priority.index);
+      if (priorityOrder != 0) return priorityOrder;
+      return a.title.compareTo(b.title);
+    });
 
     return alerts;
   }
 
+  Color _priorityColor(_AlertPriority priority) {
+    switch (priority) {
+      case _AlertPriority.critical:
+        return Colors.red;
+      case _AlertPriority.warning:
+        return Colors.orange.shade800;
+      case _AlertPriority.info:
+        return Colors.blue.shade700;
+    }
+  }
+
+  String _priorityLabel(_AlertPriority priority) {
+    switch (priority) {
+      case _AlertPriority.critical:
+        return _t('urgent', 'URGENT');
+      case _AlertPriority.warning:
+        return _t('warning', 'WARNING');
+      case _AlertPriority.info:
+        return _t('information', 'INFO');
+    }
+  }
+
+  Widget _summaryCard(IconData icon, String value, String label, Color color) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 6),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(17),
+          border: Border.all(color: color.withValues(alpha: 0.22)),
+        ),
+        child: Column(
+          children: [
+            Icon(icon, color: color, size: 22),
+            const SizedBox(height: 6),
+            Text(
+              value,
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 3),
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 10),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildSummary(List<_GardenAlert> alerts) {
     final critical = alerts
-        .where((alert) => alert.priority == AlertPriority.critical)
+        .where((a) => a.priority == _AlertPriority.critical)
         .length;
-
-    final warning = alerts
-        .where((alert) => alert.priority == AlertPriority.warning)
+    final warnings = alerts
+        .where((a) => a.priority == _AlertPriority.warning)
         .length;
-
-    final info = alerts
-        .where((alert) => alert.priority == AlertPriority.info)
-        .length;
+    final info = alerts.where((a) => a.priority == _AlertPriority.info).length;
 
     return Row(
       children: [
-        Expanded(
-          child: _summaryCard(
-            Icons.priority_high,
-            '$critical',
-            'Critical',
-            Colors.red,
-          ),
+        _summaryCard(
+          Icons.priority_high,
+          '$critical',
+          _t('urgent', 'Urgent'),
+          Colors.red,
         ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: _summaryCard(
-            Icons.warning_amber,
-            '$warning',
-            'Warnings',
-            Colors.orange,
-          ),
+        const SizedBox(width: 9),
+        _summaryCard(
+          Icons.warning_amber_rounded,
+          '$warnings',
+          _t('warnings', 'Warnings'),
+          Colors.orange,
         ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: _summaryCard(Icons.info_outline, '$info', 'Info', Colors.blue),
+        const SizedBox(width: 9),
+        _summaryCard(
+          Icons.info_outline,
+          '$info',
+          _t('information', 'Information'),
+          Colors.blue,
         ),
       ],
     );
   }
 
-  Widget _summaryCard(IconData icon, String value, String label, Color color) {
+  Widget _buildAlertImage(
+    String imageBase64,
+    Color color,
+    IconData fallbackIcon,
+  ) {
+    Widget image;
+
+    try {
+      final cleaned = imageBase64.contains(',')
+          ? imageBase64.split(',').last
+          : imageBase64;
+
+      if (cleaned.isNotEmpty) {
+        image = Image.memory(
+          base64Decode(cleaned),
+          width: 54,
+          height: 54,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) =>
+              Icon(fallbackIcon, color: color, size: 27),
+        );
+      } else {
+        image = Icon(fallbackIcon, color: color, size: 27);
+      }
+    } catch (_) {
+      image = Icon(fallbackIcon, color: color, size: 27);
+    }
+
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 8),
+      width: 54,
+      height: 54,
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: color.withOpacity(0.2)),
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(15),
       ),
-      child: Column(
-        children: [
-          Icon(icon, color: color, size: 22),
-          const SizedBox(height: 5),
-          Text(
-            value,
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            label,
-            style: TextStyle(color: Colors.grey.shade600, fontSize: 10),
-          ),
-        ],
-      ),
+      clipBehavior: Clip.antiAlias,
+      alignment: Alignment.center,
+      child: image,
     );
   }
 
   Widget _buildAlertCard(_GardenAlert alert) {
     final color = _priorityColor(alert.priority);
 
+    final String actionLabel;
+    final IconData actionIcon;
+
+    switch (alert.action) {
+      case _AlertAction.view:
+        actionLabel = _t('view_plant', 'View plant');
+        actionIcon = Icons.open_in_new;
+      case _AlertAction.scan:
+        actionLabel = _t('scan_plant', 'Scan plant');
+        actionIcon = Icons.camera_alt_outlined;
+      case _AlertAction.water:
+        actionLabel = _t('mark_watered', 'Mark watered');
+        actionIcon = Icons.water_drop_outlined;
+    }
+
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: color.withOpacity(0.22)),
+        borderRadius: BorderRadius.circular(19),
+        border: Border.all(color: color.withValues(alpha: 0.22)),
       ),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               _buildAlertImage(alert.imageBase64, color, alert.icon),
-
               const SizedBox(width: 12),
-
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            alert.title,
-                            style: const TextStyle(
-                              fontSize: 15,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-
-                        _priorityBadge(alert.priority),
-                      ],
+                    Text(
+                      alert.title,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
-
                     const SizedBox(height: 5),
-
                     Text(
                       alert.message,
                       style: TextStyle(
-                        color: Colors.grey.shade600,
+                        color: Colors.grey.shade700,
                         fontSize: 12,
-                        height: 1.35,
+                        height: 1.4,
                       ),
                     ),
                   ],
                 ),
               ),
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(9),
+                ),
+                child: Text(
+                  _priorityLabel(alert.priority),
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 9,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
             ],
           ),
-
-          const SizedBox(height: 13),
-
-          _buildActionButton(alert, color),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAlertImage(String base64, Color color, IconData icon) {
-    if (base64.isEmpty) {
-      return Container(
-        width: 58,
-        height: 58,
-        decoration: BoxDecoration(
-          color: color.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Icon(icon, color: color, size: 27),
-      );
-    }
-
-    try {
-      final bytes = Uri.parse('data:image/jpeg;base64,$base64').data
-          ?.contentAsBytes();
-
-      if (bytes == null) {
-        throw Exception();
-      }
-
-      return ClipRRect(
-        borderRadius: BorderRadius.circular(16),
-        child: Image.memory(
-          bytes,
-          width: 58,
-          height: 58,
-          fit: BoxFit.cover,
-          errorBuilder: (_, __, ___) => Container(
-            width: 58,
-            height: 58,
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(16),
+          const SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerRight,
+            child: OutlinedButton.icon(
+              onPressed: () async {
+                switch (alert.action) {
+                  case _AlertAction.view:
+                    _openPlant(alert.plantId);
+                  case _AlertAction.scan:
+                    _scanPlant(alert.plantId, alert.plantName);
+                  case _AlertAction.water:
+                    final snapshot = await _plantsRef.doc(alert.plantId).get();
+                    if (snapshot.exists) {
+                      await _markWatered(alert.plantId, snapshot.data() ?? {});
+                    }
+                }
+              },
+              icon: Icon(actionIcon, size: 17),
+              label: Text(actionLabel),
             ),
-            child: Icon(icon, color: color),
-          ),
-        ),
-      );
-    } catch (_) {
-      return Container(
-        width: 58,
-        height: 58,
-        decoration: BoxDecoration(
-          color: color.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Icon(icon, color: color),
-      );
-    }
-  }
-
-  Widget _priorityBadge(AlertPriority priority) {
-    final color = _priorityColor(priority);
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Text(
-        _priorityName(priority),
-        style: TextStyle(
-          color: color,
-          fontSize: 9,
-          fontWeight: FontWeight.bold,
-        ),
-      ),
-    );
-  }
-
-  Widget _buildActionButton(_GardenAlert alert, Color color) {
-    switch (alert.action) {
-      case AlertAction.water:
-        return Row(
-          children: [
-            Expanded(
-              child: OutlinedButton.icon(
-                onPressed: () {
-                  _openPlant(alert.plantId);
-                },
-                icon: const Icon(Icons.eco_outlined, size: 17),
-                label: const Text('View Plant'),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: ElevatedButton.icon(
-                onPressed: () {
-                  _markWatered(alert.plantId);
-                },
-                icon: const Icon(Icons.water_drop, size: 17),
-                label: const Text('Watered'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.blue.shade600,
-                  foregroundColor: Colors.white,
-                ),
-              ),
-            ),
-          ],
-        );
-
-      case AlertAction.scan:
-        return Row(
-          children: [
-            Expanded(
-              child: OutlinedButton(
-                onPressed: () {
-                  _openPlant(alert.plantId);
-                },
-                child: const Text('View Plant'),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: ElevatedButton.icon(
-                onPressed: () {
-                  _scanPlant(alert.plantId, alert.plantName);
-                },
-                icon: const Icon(Icons.camera_alt, size: 17),
-                label: const Text('Scan Now'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: color,
-                  foregroundColor: Colors.white,
-                ),
-              ),
-            ),
-          ],
-        );
-
-      case AlertAction.viewPlant:
-        return SizedBox(
-          width: double.infinity,
-          child: ElevatedButton.icon(
-            onPressed: () {
-              _openPlant(alert.plantId);
-            },
-            icon: const Icon(Icons.open_in_new, size: 17),
-            label: const Text('View Plant'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: color,
-              foregroundColor: Colors.white,
-            ),
-          ),
-        );
-    }
-  }
-
-  Color _priorityColor(AlertPriority priority) {
-    switch (priority) {
-      case AlertPriority.critical:
-        return Colors.red.shade700;
-
-      case AlertPriority.warning:
-        return Colors.orange.shade700;
-
-      case AlertPriority.info:
-        return Colors.blue.shade700;
-    }
-  }
-
-  String _priorityName(AlertPriority priority) {
-    switch (priority) {
-      case AlertPriority.critical:
-        return 'CRITICAL';
-
-      case AlertPriority.warning:
-        return 'WARNING';
-
-      case AlertPriority.info:
-        return 'INFO';
-    }
-  }
-
-  Widget _buildEmptyState() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(30),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: Colors.green.shade100),
-      ),
-      child: Column(
-        children: [
-          const Text('🌿', style: TextStyle(fontSize: 60)),
-
-          const SizedBox(height: 10),
-
-          const Text(
-            'Your garden looks good!',
-            style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 7),
-
-          Text(
-            'No urgent alerts were detected.',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
           ),
         ],
       ),
@@ -728,47 +561,57 @@ class _SmartAlertsPageState extends State<SmartAlertsPage> {
 
   Widget _buildNoPlants() {
     return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(30),
+      padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: Colors.green.shade100),
       ),
       child: Column(
         children: [
-          const Text('🌱', style: TextStyle(fontSize: 60)),
-
-          const SizedBox(height: 10),
-
-          const Text(
-            'No plants yet',
-            style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 7),
-
+          Icon(Icons.eco_outlined, size: 58, color: Colors.green.shade600),
+          const SizedBox(height: 14),
           Text(
-            'Add a plant and Smart Alerts will monitor it for you.',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+            _t('garden_waiting', 'Your garden is waiting!'),
+            style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
           ),
-
-          const SizedBox(height: 18),
-
-          ElevatedButton.icon(
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const AddPlantPage()),
-              );
-            },
-            icon: const Icon(Icons.add),
-            label: const Text('Add Plant'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.green.shade700,
-              foregroundColor: Colors.white,
+          const SizedBox(height: 8),
+          Text(
+            _t(
+              'add_plant_for_alerts',
+              'Add a plant to receive watering reminders and health alerts.',
             ),
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.grey.shade600, height: 1.5),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyAlerts() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(22),
+      ),
+      child: Column(
+        children: [
+          Icon(
+            Icons.check_circle_outline,
+            size: 55,
+            color: Colors.green.shade600,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            _t('all_caught_up', 'All caught up!'),
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            _t('no_alerts_match', 'No alerts match this filter right now.'),
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.grey.shade600),
           ),
         ],
       ),
@@ -778,195 +621,273 @@ class _SmartAlertsPageState extends State<SmartAlertsPage> {
   @override
   Widget build(BuildContext context) {
     if (_auth.currentUser == null) {
-      return const Scaffold(body: Center(child: Text('Please log in again.')));
+      return AnimatedBuilder(
+        animation: _language,
+        builder: (context, _) {
+          return Scaffold(
+            body: Center(
+              child: Text(
+                _t('please_login_alerts', 'Please log in to view your alerts.'),
+              ),
+            ),
+          );
+        },
+      );
     }
 
-    return Scaffold(
-      backgroundColor: const Color(0xFFF6FAF5),
-
-      appBar: AppBar(
-        title: const Text(
-          'Smart Alerts',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-        backgroundColor: const Color(0xFFF6FAF5),
-        elevation: 0,
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: _refresh,
-            icon: _refreshing
-                ? const SizedBox(
-                    width: 19,
-                    height: 19,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh),
+    return AnimatedBuilder(
+      animation: _language,
+      builder: (context, _) {
+        return Scaffold(
+          backgroundColor: const Color(0xFFF5F9F3),
+          appBar: AppBar(
+            title: Text(
+              _t('smart_alerts', 'Smart Alerts'),
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            backgroundColor: const Color(0xFFF5F9F3),
+            elevation: 0,
+            actions: [
+              IconButton(
+                tooltip: _t('refresh', 'Refresh'),
+                onPressed: _refresh,
+                icon: _refreshing
+                    ? const SizedBox(
+                        width: 19,
+                        height: 19,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.refresh),
+              ),
+            ],
           ),
-        ],
-      ),
-
-      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-        stream: _plantsRef.snapshots(),
-
-        builder: (context, snapshot) {
-          if (snapshot.hasError) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Text(
-                  'Unable to load alerts.\n\n'
-                  '${snapshot.error}',
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            );
-          }
-
-          if (!snapshot.hasData) {
-            return const Center(child: CircularProgressIndicator());
-          }
-
-          final plants = snapshot.data!.docs;
-
-          if (plants.isEmpty) {
-            return RefreshIndicator(
-              onRefresh: _refresh,
-              child: ListView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                padding: const EdgeInsets.all(20),
-                children: [_buildNoPlants()],
-              ),
-            );
-          }
-
-          final alerts = _buildAlerts(plants);
-
-          return RefreshIndicator(
-            onRefresh: _refresh,
-
-            child: ListView(
-              physics: const AlwaysScrollableScrollPhysics(),
-
-              padding: const EdgeInsets.fromLTRB(20, 10, 20, 30),
-
-              children: [
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(18),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [Colors.green.shade800, Colors.green.shade500],
+          body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: _plantsRef.snapshots(),
+            builder: (context, snapshot) {
+              if (snapshot.hasError) {
+                return Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      '${_t('unable_to_load_alerts', 'Unable to load garden alerts.')}\n\n${snapshot.error}',
+                      textAlign: TextAlign.center,
                     ),
-                    borderRadius: BorderRadius.circular(22),
                   ),
-                  child: const Row(
-                    children: [
-                      Icon(
-                        Icons.notifications_active_outlined,
-                        color: Colors.white,
-                        size: 32,
-                      ),
-                      SizedBox(width: 13),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Your garden assistant',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 17,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            SizedBox(height: 4),
-                            Text(
-                              'Smart Alerts watches plant health, watering and AI scan reminders.',
-                              style: TextStyle(
-                                color: Colors.white70,
-                                fontSize: 11,
-                                height: 1.4,
-                              ),
-                            ),
+                );
+              }
+
+              if (!snapshot.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
+
+              final plants = snapshot.data!.docs;
+
+              if (plants.isEmpty) {
+                return RefreshIndicator(
+                  onRefresh: _refresh,
+                  child: ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(20),
+                    children: [_buildNoPlants()],
+                  ),
+                );
+              }
+
+              final alerts = _buildAlerts(plants);
+
+              final filteredAlerts = _filter == 'All'
+                  ? alerts
+                  : alerts.where((alert) {
+                      switch (_filter) {
+                        case 'Urgent':
+                          return alert.priority == _AlertPriority.critical;
+                        case 'Warnings':
+                          return alert.priority == _AlertPriority.warning;
+                        case 'Info':
+                          return alert.priority == _AlertPriority.info;
+                        default:
+                          return true;
+                      }
+                    }).toList();
+
+              return RefreshIndicator(
+                onRefresh: _refresh,
+                child: ListView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  padding: const EdgeInsets.fromLTRB(18, 10, 18, 28),
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(18),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            Colors.green.shade800,
+                            Colors.green.shade500,
                           ],
                         ),
+                        borderRadius: BorderRadius.circular(22),
                       ),
-                    ],
-                  ),
-                ),
-
-                const SizedBox(height: 18),
-
-                _buildSummary(alerts),
-
-                const SizedBox(height: 25),
-
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'Attention Center',
-                      style: TextStyle(
-                        fontSize: 19,
-                        fontWeight: FontWeight.bold,
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.notifications_active_outlined,
+                            color: Colors.white,
+                            size: 34,
+                          ),
+                          const SizedBox(width: 13),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _t(
+                                    'garden_in_the_loop',
+                                    'Your garden, in the loop',
+                                  ),
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 5),
+                                Text(
+                                  _t(
+                                    'review_garden_reminders',
+                                    'Review watering schedules and plant health reminders.',
+                                  ),
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12,
+                                    height: 1.4,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
                     ),
+                    const SizedBox(height: 16),
+                    _buildSummary(alerts),
+                    const SizedBox(height: 18),
                     Text(
-                      '${alerts.length} alert${alerts.length == 1 ? '' : 's'}',
+                      _t('filter_alerts', 'Filter alerts'),
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                    const SizedBox(height: 9),
+                    Wrap(
+                      spacing: 8,
+                      children: [
+                        _FilterOption(
+                          value: 'All',
+                          label: _t('all', 'All'),
+                          selected: _filter == 'All',
+                          onSelected: () => setState(() => _filter = 'All'),
+                        ),
+                        _FilterOption(
+                          value: 'Urgent',
+                          label: _t('urgent', 'Urgent'),
+                          selected: _filter == 'Urgent',
+                          onSelected: () => setState(() => _filter = 'Urgent'),
+                        ),
+                        _FilterOption(
+                          value: 'Warnings',
+                          label: _t('warnings', 'Warnings'),
+                          selected: _filter == 'Warnings',
+                          onSelected: () =>
+                              setState(() => _filter = 'Warnings'),
+                        ),
+                        _FilterOption(
+                          value: 'Info',
+                          label: _t('information', 'Info'),
+                          selected: _filter == 'Info',
+                          onSelected: () => setState(() => _filter = 'Info'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 15),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _t('garden_alerts', 'Garden alerts'),
+                            style: const TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          _t(
+                            'alerts_found',
+                            '{count} found',
+                          ).replaceAll('{count}', '${filteredAlerts.length}'),
+                          style: TextStyle(
+                            color: Colors.grey.shade600,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    if (filteredAlerts.isEmpty)
+                      _buildEmptyAlerts()
+                    else
+                      ...filteredAlerts.map(_buildAlertCard),
+                    const SizedBox(height: 12),
+                    Text(
+                      _t(
+                        'watering_safety_note',
+                        'Watering reminders are based on your saved schedule. Check soil moisture before watering.',
+                      ),
                       style: TextStyle(
                         color: Colors.grey.shade600,
-                        fontSize: 12,
+                        fontSize: 11,
+                        height: 1.45,
                       ),
                     ),
                   ],
                 ),
-
-                const SizedBox(height: 12),
-
-                if (alerts.isEmpty)
-                  _buildEmptyState()
-                else
-                  ...alerts.map(_buildAlertCard),
-
-                const SizedBox(height: 15),
-
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.blue.shade50,
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: const Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(Icons.info_outline, color: Colors.blue, size: 20),
-                      SizedBox(width: 9),
-                      Expanded(
-                        child: Text(
-                          'AI health results are visual estimates. For serious plant disease or crop loss, confirm the diagnosis with an agricultural professional.',
-                          style: TextStyle(
-                            color: Colors.blueGrey,
-                            fontSize: 10,
-                            height: 1.4,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 }
 
-enum AlertPriority { critical, warning, info }
+class _FilterOption extends StatelessWidget {
+  final String value;
+  final String label;
+  final bool selected;
+  final VoidCallback onSelected;
 
-enum AlertAction { viewPlant, scan, water }
+  const _FilterOption({
+    required this.value,
+    required this.label,
+    required this.selected,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ChoiceChip(
+      label: Text(label),
+      selected: selected,
+      onSelected: (_) => onSelected(),
+      selectedColor: Colors.green.shade100,
+    );
+  }
+}
+
+enum _AlertPriority { critical, warning, info }
+
+enum _AlertAction { view, scan, water }
 
 class _GardenAlert {
   final String id;
@@ -974,12 +895,12 @@ class _GardenAlert {
   final String plantName;
   final String title;
   final String message;
-  final AlertPriority priority;
+  final _AlertPriority priority;
   final IconData icon;
   final String imageBase64;
-  final AlertAction action;
+  final _AlertAction action;
 
-  _GardenAlert({
+  const _GardenAlert({
     required this.id,
     required this.plantId,
     required this.plantName,

@@ -1,13 +1,13 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
+import 'package:image_picker/image_picker.dart';
 
-import 'plant_detail_page.dart';
+import '../services/app_language_service.dart';
 
 class PlantScannerPage extends StatefulWidget {
   final String? plantId;
@@ -20,847 +20,335 @@ class PlantScannerPage extends StatefulWidget {
 }
 
 class _PlantScannerPageState extends State<PlantScannerPage> {
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-
   final ImagePicker _picker = ImagePicker();
 
-  File? _image;
+  static const String backendUrl =
+      'https://urban-farming-ai-backend.onrender.com/analyze';
 
-  bool _loading = false;
+  final AppLanguageService _language = AppLanguageService.instance;
 
-  String? _selectedPlantId;
+  File? selectedImage;
+  bool isAnalyzing = false;
+  Map<String, dynamic>? analysisResult;
 
-  String? _selectedPlantName;
-
-  Map<String, dynamic>? _analysis;
-
-  List<QueryDocumentSnapshot<Map<String, dynamic>>> _plants = [];
-
-  static const String backendUrl = 'http://10.148.48.188:8000';
-
-  @override
-  void initState() {
-    super.initState();
-
-    _selectedPlantId = widget.plantId;
-
-    _selectedPlantName = widget.plantName;
-
-    _loadPlants();
+  String _t(String key, String fallback) {
+    final translated = _language.translate(key);
+    return translated == key || translated.trim().isEmpty
+        ? fallback
+        : translated;
   }
 
-  CollectionReference<Map<String, dynamic>> get _plantsRef {
-    final uid = _auth.currentUser!.uid;
+  String get _languageName => _language.language.displayName;
 
-    return _firestore.collection('users').doc(uid).collection('plants');
-  }
-
-  Future<void> _loadPlants() async {
-    if (_auth.currentUser == null) {
-      return;
-    }
+  Future<void> takePhoto() async {
+    if (isAnalyzing) return;
 
     try {
-      final snapshot = await _plantsRef
-          .orderBy('createdAt', descending: true)
-          .get();
-
-      if (!mounted) return;
-
-      setState(() {
-        _plants = snapshot.docs;
-
-        if (_selectedPlantId != null) {
-          final exists = _plants.any((plant) => plant.id == _selectedPlantId);
-
-          if (!exists) {
-            _selectedPlantId = null;
-            _selectedPlantName = null;
-          }
-        }
-      });
-    } catch (_) {}
-  }
-
-  Future<void> _pickImage(ImageSource source) async {
-    try {
-      final picked = await _picker.pickImage(
-        source: source,
-        imageQuality: 85,
-        maxWidth: 1600,
+      final image = await _picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 70,
+        maxWidth: 1280,
+        maxHeight: 1280,
       );
 
-      if (picked == null) {
-        return;
-      }
+      if (image == null || !mounted) return;
 
       setState(() {
-        _image = File(picked.path);
-        _analysis = null;
+        selectedImage = File(image.path);
+        analysisResult = null;
       });
-    } catch (e) {
-      _showMessage('Could not select image: $e');
+    } catch (error) {
+      debugPrint('Camera error: $error');
+      _showError(
+        _t('camera_error', 'Could not open the camera. Please try again.'),
+      );
     }
   }
 
-  void _showImageOptions() {
-    showModalBottomSheet(
-      context: context,
+  Future<void> chooseFromGallery() async {
+    if (isAnalyzing) return;
 
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
+    try {
+      final image = await _picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 70,
+        maxWidth: 1280,
+        maxHeight: 1280,
+      );
 
-      builder: (context) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(20),
+      if (image == null || !mounted) return;
 
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-
-              children: [
-                const Text(
-                  'Choose Image',
-                  style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
-                ),
-
-                const SizedBox(height: 18),
-
-                ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor: Colors.green.shade50,
-                    child: Icon(Icons.camera_alt, color: Colors.green.shade700),
-                  ),
-
-                  title: const Text('Take a photo'),
-
-                  subtitle: const Text('Use your camera'),
-
-                  onTap: () {
-                    Navigator.pop(context);
-
-                    _pickImage(ImageSource.camera);
-                  },
-                ),
-
-                ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor: Colors.green.shade50,
-                    child: Icon(
-                      Icons.photo_library,
-                      color: Colors.green.shade700,
-                    ),
-                  ),
-
-                  title: const Text('Choose from gallery'),
-
-                  subtitle: const Text('Select an existing photo'),
-
-                  onTap: () {
-                    Navigator.pop(context);
-
-                    _pickImage(ImageSource.gallery);
-                  },
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
+      setState(() {
+        selectedImage = File(image.path);
+        analysisResult = null;
+      });
+    } catch (error) {
+      debugPrint('Gallery error: $error');
+      _showError(
+        _t('gallery_error', 'Could not select the image. Please try again.'),
+      );
+    }
   }
 
-  Future<void> _analyzePlant() async {
-    if (_image == null) {
-      _showMessage('Please add a plant photo first.');
-
-      return;
-    }
-
-    if (_selectedPlantId == null) {
-      _showMessage('Please select a plant first.');
-
-      return;
-    }
+  Future<void> analyzePlant() async {
+    if (selectedImage == null || isAnalyzing) return;
 
     setState(() {
-      _loading = true;
-      _analysis = null;
+      isAnalyzing = true;
+      analysisResult = null;
     });
 
     try {
-      final request = http.MultipartRequest(
-        'POST',
-        Uri.parse('$backendUrl/analyze'),
-      );
+      final file = selectedImage!;
+
+      if (!await file.exists() || await file.length() == 0) {
+        throw Exception('The selected image is missing or empty.');
+      }
+
+      final path = file.path.toLowerCase();
+      final MediaType contentType;
+
+      if (path.endsWith('.png')) {
+        contentType = MediaType('image', 'png');
+      } else if (path.endsWith('.webp')) {
+        contentType = MediaType('image', 'webp');
+      } else {
+        contentType = MediaType('image', 'jpeg');
+      }
+
+      final request = http.MultipartRequest('POST', Uri.parse(backendUrl));
+
+      // Send the current app language to the AI backend.
+      request.fields['language'] = _languageName;
+
+      // Preserve optional plant context.
+      if (widget.plantId != null) {
+        request.fields['plantId'] = widget.plantId!;
+      }
+
+      if (widget.plantName != null) {
+        request.fields['plantName'] = widget.plantName!;
+      }
 
       request.files.add(
-        await http.MultipartFile.fromPath('file', _image!.path),
+        await http.MultipartFile.fromPath(
+          'file',
+          file.path,
+          contentType: contentType,
+        ),
       );
 
-      final response = await request.send();
+      final streamedResponse = await request.send().timeout(
+        const Duration(seconds: 120),
+      );
 
-      final responseBody = await response.stream.bytesToString();
+      final response = await http.Response.fromStream(streamedResponse)
+          .timeout(const Duration(seconds: 60));
 
       if (response.statusCode != 200) {
-        throw Exception('Server returned ${response.statusCode}');
+        var message = 'Plant analysis failed (${response.statusCode}).';
+
+        try {
+          final decoded = jsonDecode(response.body);
+
+          if (decoded is Map) {
+            message =
+                decoded['detail']?.toString() ??
+                decoded['error']?.toString() ??
+                message;
+          }
+        } catch (_) {
+          // Keep the default error message if the response is not JSON.
+        }
+
+        throw Exception(message);
       }
 
-      final decoded = jsonDecode(responseBody) as Map<String, dynamic>;
+      final decoded = jsonDecode(response.body);
 
-      if (decoded['success'] != true) {
-        throw Exception(decoded['error']?.toString() ?? 'AI analysis failed');
+      if (decoded is! Map || decoded['analysis'] is! Map) {
+        throw Exception('The server returned an invalid analysis.');
       }
-
-      final result = Map<String, dynamic>.from(
-        decoded['analysis'] ?? <String, dynamic>{},
-      );
-
-      await _saveAnalysis(result);
 
       if (!mounted) return;
 
       setState(() {
-        _analysis = result;
+        analysisResult = Map<String, dynamic>.from(decoded['analysis'] as Map);
       });
+    } on TimeoutException {
+      _showError(
+        _t(
+          'ai_timeout',
+          'The AI server took too long to respond. Please try again.',
+        ),
+      );
+    } catch (error) {
+      debugPrint('Plant analysis error: $error');
 
-      _showMessage('AI analysis completed successfully.');
-    } catch (e) {
-      if (!mounted) return;
-
-      _showMessage('Analysis failed: $e');
+      _showError(error.toString().replaceFirst('Exception: ', ''));
     } finally {
-      if (!mounted) return;
-
-      setState(() {
-        _loading = false;
-      });
+      if (mounted) {
+        setState(() {
+          isAnalyzing = false;
+        });
+      }
     }
   }
 
-  int _calculateHealthScore(Map<String, dynamic> result, int oldScore) {
-    final disease = result['disease']?.toString().toLowerCase() ?? '';
+  void _showError(String message) {
+    if (!mounted) return;
 
-    final severity = result['severity']?.toString().toLowerCase() ?? '';
-
-    final confidence = (result['confidence'] as num?)?.toDouble() ?? 0;
-
-    int score;
-
-    if (disease.contains('healthy') || disease == 'none') {
-      score = 95;
-    } else if (severity == 'severe') {
-      score = 35;
-    } else if (severity == 'moderate') {
-      score = 60;
-    } else if (severity == 'mild') {
-      score = 78;
-    } else {
-      score = oldScore;
-    }
-
-    if (confidence < 45) {
-      score = ((score + oldScore) / 2).round();
-    }
-
-    return score.clamp(0, 100);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 5)),
+    );
   }
 
-  Future<void> _saveAnalysis(Map<String, dynamic> result) async {
-    final plantId = _selectedPlantId;
+  dynamic _value(List<String> keys) {
+    for (final key in keys) {
+      final value = analysisResult?[key];
 
-    if (plantId == null) {
-      return;
+      if (value != null && value.toString().trim().isNotEmpty) {
+        return value;
+      }
     }
 
-    final plantRef = _plantsRef.doc(plantId);
-
-    final plantSnapshot = await plantRef.get();
-
-    if (!plantSnapshot.exists) {
-      return;
-    }
-
-    final plantData = plantSnapshot.data()!;
-
-    final oldHealth = (plantData['healthScore'] as num?)?.toInt() ?? 100;
-
-    final newHealth = _calculateHealthScore(result, oldHealth);
-
-    final disease = result['disease']?.toString() ?? 'Unknown';
-
-    final confidence = (result['confidence'] as num?)?.toDouble() ?? 0;
-
-    final severity = result['severity']?.toString() ?? 'Unknown';
-
-    final observations = result['observations']?.toString() ?? '';
-
-    final possibleCauses = _stringList(result['possibleCauses']);
-
-    final treatment = _stringList(result['treatment']);
-
-    final prevention = _stringList(result['prevention']);
-
-    final recoveryPlan = _stringList(result['recoveryPlan']);
-
-    final wateringAdvice = result['wateringAdvice']?.toString() ?? '';
-
-    final sunlightAdvice = result['sunlightAdvice']?.toString() ?? '';
-
-    final needsRescan = result['needsRescan'] == true;
-
-    final rescanAfterDays = (result['rescanAfterDays'] as num?)?.toInt() ?? 7;
-
-    await plantRef.update({
-      'previousHealthScore': oldHealth,
-
-      'healthScore': newHealth,
-
-      'diseaseStatus': disease,
-
-      'lastScanDisease': disease,
-
-      'lastScanConfidence': confidence,
-
-      'lastScanSeverity': severity,
-
-      'lastScanAt': FieldValue.serverTimestamp(),
-
-      'status': newHealth < 40
-          ? 'Critical'
-          : newHealth < 80
-          ? 'Needs Attention'
-          : 'Healthy',
-
-      'observations': observations,
-
-      'possibleCauses': possibleCauses,
-
-      'treatment': treatment,
-
-      'prevention': prevention,
-
-      'wateringAdvice': wateringAdvice,
-
-      'sunlightAdvice': sunlightAdvice,
-
-      'recoveryPlan': recoveryPlan,
-
-      'needsRescan': needsRescan,
-
-      'rescanAfterDays': rescanAfterDays,
-
-      'updatedAt': FieldValue.serverTimestamp(),
-    });
-
-    await plantRef.collection('scans').add({
-      'disease': disease,
-
-      'confidence': confidence,
-
-      'severity': severity,
-
-      'observations': observations,
-
-      'possibleCauses': possibleCauses,
-
-      'treatment': treatment,
-
-      'prevention': prevention,
-
-      'wateringAdvice': wateringAdvice,
-
-      'sunlightAdvice': sunlightAdvice,
-
-      'recoveryPlan': recoveryPlan,
-
-      'needsRescan': needsRescan,
-
-      'rescanAfterDays': rescanAfterDays,
-
-      'healthScore': newHealth,
-
-      'imageName': _image!.path.split(Platform.pathSeparator).last,
-
-      'createdAt': FieldValue.serverTimestamp(),
-    });
-
-    await plantRef.collection('diary').add({
-      'type': 'Scan',
-
-      'title': 'AI Plant Health Scan',
-
-      'note':
-          '$disease detected with '
-          '${confidence.toStringAsFixed(0)}% confidence. '
-          'Health score: $newHealth/100.',
-
-      'createdAt': FieldValue.serverTimestamp(),
-    });
+    return null;
   }
 
-  List<String> _stringList(dynamic value) {
-    if (value is List) {
-      return value.map((item) => item.toString()).toList();
-    }
-
-    if (value is String && value.trim().isNotEmpty) {
-      return [value];
-    }
-
-    return [];
+  String _text(List<String> keys, {String fallback = 'Not available'}) {
+    return _value(keys)?.toString() ?? fallback;
   }
 
-  void _showMessage(String message) {
-    if (!mounted) {
-      return;
-    }
-
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(message)));
+  List<dynamic> _list(List<String> keys) {
+    final value = _value(keys);
+    return value is List ? value : <dynamic>[];
   }
 
-  Widget _buildPlantSelector() {
-    if (_plants.isEmpty) {
-      return Container(
-        padding: const EdgeInsets.all(16),
+  int _confidenceValue() {
+    final raw = _value(['confidence']);
 
-        decoration: BoxDecoration(
-          color: Colors.orange.shade50,
+    final number = raw is num
+        ? raw.toDouble()
+        : double.tryParse(raw?.toString() ?? '') ?? 0;
 
-          borderRadius: BorderRadius.circular(18),
+    return number.round().clamp(0, 100);
+  }
 
-          border: Border.all(color: Colors.orange.shade200),
-        ),
+  Color _statusColor(String status) {
+    final value = status.toLowerCase();
 
-        child: const Row(
-          children: [
-            Icon(Icons.info_outline, color: Colors.orange),
-
-            SizedBox(width: 10),
-
-            Expanded(
-              child: Text(
-                'Add a plant to your garden before running an AI scan.',
-              ),
-            ),
-          ],
-        ),
-      );
+    if (value.contains('severe') || value.contains('critical')) {
+      return Colors.red.shade700;
     }
 
+    if (value.contains('moderate') || value.contains('mild')) {
+      return Colors.orange.shade800;
+    }
+
+    if (value.contains('healthy') || value == 'none') {
+      return Colors.green.shade700;
+    }
+
+    return Colors.blueGrey.shade700;
+  }
+
+  Widget _card({required String title, required Widget child}) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 3),
-
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
         color: Colors.white,
-
-        borderRadius: BorderRadius.circular(18),
-
+        borderRadius: BorderRadius.circular(20),
         border: Border.all(color: Colors.green.shade100),
       ),
-
-      child: DropdownButtonHideUnderline(
-        child: DropdownButton<String>(
-          value: _selectedPlantId,
-
-          isExpanded: true,
-
-          hint: const Text('Select the plant'),
-
-          items: _plants.map((plant) {
-            final data = plant.data();
-
-            final name = data['name']?.toString() ?? 'Unnamed Plant';
-
-            final type = data['type']?.toString() ?? 'Plant';
-
-            return DropdownMenuItem<String>(
-              value: plant.id,
-
-              child: Row(
-                children: [
-                  const Text('🌿'),
-
-                  const SizedBox(width: 8),
-
-                  Expanded(
-                    child: Text(
-                      '$name • $type',
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-              ),
-            );
-          }).toList(),
-
-          onChanged: (value) {
-            if (value == null) {
-              return;
-            }
-
-            final selected = _plants.firstWhere((plant) => plant.id == value);
-
-            final data = selected.data();
-
-            setState(() {
-              _selectedPlantId = value;
-
-              _selectedPlantName = data['name']?.toString();
-
-              _analysis = null;
-            });
-          },
-        ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          child,
+        ],
       ),
     );
   }
 
-  Widget _buildImageArea() {
-    if (_image == null) {
-      return InkWell(
-        onTap: _showImageOptions,
+  Widget _sectionCard(String title, List<dynamic> items) {
+    if (items.isEmpty) return const SizedBox.shrink();
 
-        borderRadius: BorderRadius.circular(24),
+    return _card(
+      title: title,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: items.map((item) {
+          if (item is Map) {
+            final day = item['day']?.toString() ?? '';
+            final action = item['action']?.toString() ?? '';
 
-        child: Container(
-          width: double.infinity,
-
-          height: 260,
-
-          decoration: BoxDecoration(
-            color: Colors.white,
-
-            borderRadius: BorderRadius.circular(24),
-
-            border: Border.all(color: Colors.green.shade200, width: 1.5),
-          ),
-
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-
-            children: [
-              Container(
-                width: 76,
-                height: 76,
-
-                decoration: BoxDecoration(
-                  color: Colors.green.shade50,
-                  shape: BoxShape.circle,
-                ),
-
-                child: Icon(
-                  Icons.add_a_photo_outlined,
-                  size: 36,
-                  color: Colors.green.shade700,
-                ),
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Text(
+                '${day.isEmpty ? '' : '$day: '}$action',
+                style: const TextStyle(height: 1.5),
               ),
+            );
+          }
 
-              const SizedBox(height: 15),
-
-              const Text(
-                'Add a plant photo',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-
-              const SizedBox(height: 6),
-
-              Text(
-                'Take a clear photo of the leaf or plant',
-
-                style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
-              ),
-
-              const SizedBox(height: 15),
-
-              Text(
-                'Camera • Gallery',
-
-                style: TextStyle(
-                  color: Colors.green.shade700,
-                  fontWeight: FontWeight.w600,
-                  fontSize: 12,
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    return Stack(
-      children: [
-        ClipRRect(
-          borderRadius: BorderRadius.circular(24),
-
-          child: Image.file(
-            _image!,
-            width: double.infinity,
-            height: 300,
-            fit: BoxFit.cover,
-          ),
-        ),
-
-        Positioned(
-          top: 12,
-          right: 12,
-
-          child: Container(
-            decoration: const BoxDecoration(
-              color: Colors.black54,
-              shape: BoxShape.circle,
-            ),
-
-            child: IconButton(
-              onPressed: _showImageOptions,
-
-              icon: const Icon(Icons.edit, color: Colors.white),
-            ),
-          ),
-        ),
-
-        Positioned(
-          left: 12,
-          bottom: 12,
-
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-
-            decoration: BoxDecoration(
-              color: Colors.black54,
-
-              borderRadius: BorderRadius.circular(20),
-            ),
-
-            child: const Row(
-              mainAxisSize: MainAxisSize.min,
-
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Icon(Icons.check_circle, color: Colors.white, size: 16),
-
-                SizedBox(width: 5),
-
-                Text(
-                  'Photo ready',
-                  style: TextStyle(color: Colors.white, fontSize: 12),
+                Icon(Icons.circle, size: 7, color: Colors.green.shade700),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    item.toString(),
+                    style: const TextStyle(height: 1.5),
+                  ),
                 ),
               ],
             ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAnalyzeButton() {
-    final ready = _image != null && _selectedPlantId != null;
-
-    return SizedBox(
-      width: double.infinity,
-
-      height: 58,
-
-      child: ElevatedButton.icon(
-        onPressed: _loading || !ready ? null : _analyzePlant,
-
-        icon: _loading
-            ? const SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2.5,
-                  color: Colors.white,
-                ),
-              )
-            : const Icon(Icons.auto_awesome),
-
-        label: Text(
-          _loading ? 'AI is analyzing...' : 'Analyze Plant with AI',
-
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-        ),
-
-        style: ElevatedButton.styleFrom(
-          backgroundColor: Colors.green.shade700,
-
-          foregroundColor: Colors.white,
-
-          disabledBackgroundColor: Colors.grey.shade300,
-
-          disabledForegroundColor: Colors.grey.shade600,
-
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(18),
-          ),
-        ),
+          );
+        }).toList(),
       ),
     );
   }
 
-  Widget _buildResult() {
-    if (_analysis == null) {
-      return const SizedBox();
+  Widget _textCard(String title, String text) {
+    if (text.trim().isEmpty || text == 'Not available') {
+      return const SizedBox.shrink();
     }
 
-    final result = _analysis!;
+    return _card(
+      title: title,
+      child: Text(text, style: const TextStyle(height: 1.5)),
+    );
+  }
 
-    final disease = result['disease']?.toString() ?? 'Unknown';
-
-    final confidence = (result['confidence'] as num?)?.toDouble() ?? 0;
-
-    final severity = result['severity']?.toString() ?? 'Unknown';
-
-    final observations = result['observations']?.toString() ?? '';
-
-    final treatment = _stringList(result['treatment']);
-
-    final prevention = _stringList(result['prevention']);
-
-    final health = _calculateHealthScore(result, 100);
-
-    final healthy =
-        disease.toLowerCase().contains('healthy') ||
-        disease.toLowerCase() == 'none';
-
-    final statusColor = healthy
-        ? Colors.green
-        : severity.toLowerCase().contains('severe')
-        ? Colors.red
-        : Colors.orange;
-
-    return Container(
-      width: double.infinity,
-
-      padding: const EdgeInsets.all(18),
-
-      decoration: BoxDecoration(
-        color: Colors.white,
-
-        borderRadius: BorderRadius.circular(22),
-
-        border: Border.all(color: statusColor.withOpacity(0.25)),
-      ),
-
-      child: Column(
+  Widget _detailRow(String title, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
-
         children: [
-          Row(
-            children: [
-              Container(
-                width: 50,
-                height: 50,
-
-                decoration: BoxDecoration(
-                  color: statusColor.withOpacity(0.1),
-                  shape: BoxShape.circle,
-                ),
-
-                child: Icon(
-                  healthy
-                      ? Icons.check_circle_outline
-                      : Icons.warning_amber_outlined,
-                  color: statusColor,
-                ),
-              ),
-
-              const SizedBox(width: 12),
-
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-
-                  children: [
-                    const Text(
-                      'AI Diagnosis',
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
-
-                    const SizedBox(height: 2),
-
-                    Text(
-                      disease,
-                      style: const TextStyle(
-                        fontSize: 19,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-
-              Text(
-                '${confidence.toStringAsFixed(0)}%',
-
-                style: TextStyle(
-                  color: statusColor,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 17,
-                ),
-              ),
-            ],
-          ),
-
-          const SizedBox(height: 18),
-
-          Row(
-            children: [
-              Expanded(child: _resultStat('Health', '$health/100')),
-
-              Expanded(child: _resultStat('Severity', severity)),
-
-              Expanded(
-                child: _resultStat(
-                  'Confidence',
-                  '${confidence.toStringAsFixed(0)}%',
-                ),
-              ),
-            ],
-          ),
-
-          if (observations.trim().isNotEmpty) ...[
-            const SizedBox(height: 18),
-
-            _resultSection('Observations', observations),
-          ],
-
-          if (treatment.isNotEmpty) ...[
-            const SizedBox(height: 14),
-
-            _bulletSection('Treatment', treatment),
-          ],
-
-          if (prevention.isNotEmpty) ...[
-            const SizedBox(height: 14),
-
-            _bulletSection('Prevention', prevention),
-          ],
-
-          const SizedBox(height: 18),
-
           SizedBox(
-            width: double.infinity,
-
-            child: OutlinedButton.icon(
-              onPressed: _selectedPlantId == null
-                  ? null
-                  : () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) =>
-                              PlantDetailPage(plantId: _selectedPlantId!),
-                        ),
-                      );
-                    },
-
-              icon: const Icon(Icons.open_in_new),
-
-              label: const Text('View Plant Details'),
+            width: 105,
+            child: Text(
+              title,
+              style: TextStyle(
+                color: Colors.grey.shade600,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(fontWeight: FontWeight.w600, height: 1.4),
             ),
           ),
         ],
@@ -868,93 +356,104 @@ class _PlantScannerPageState extends State<PlantScannerPage> {
     );
   }
 
-  Widget _resultStat(String title, String value) {
-    return Column(
-      children: [
-        Text(
-          value,
+  Widget _buildAnalysis() {
+    if (analysisResult == null) return const SizedBox.shrink();
 
-          maxLines: 1,
+    final plant = _text([
+      'plant',
+      'plant_detected',
+    ], fallback: widget.plantName ?? 'Unknown plant');
 
-          overflow: TextOverflow.ellipsis,
+    final status = _text(['status', 'health_status'], fallback: 'Unclear');
 
-          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
-        ),
+    final disease = _text(['disease'], fallback: 'Not identified');
 
-        const SizedBox(height: 3),
+    final severity = _text(['severity'], fallback: 'Unknown');
 
-        Text(
-          title,
+    final confidence = _confidenceValue();
+    final statusColor = _statusColor(status);
 
-          style: TextStyle(color: Colors.grey.shade600, fontSize: 10),
-        ),
-      ],
-    );
-  }
-
-  Widget _resultSection(String title, String content) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
-
       children: [
+        const SizedBox(height: 24),
         Text(
-          title,
-
-          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+          _t('ai_diagnosis', 'AI Diagnosis'),
+          style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
         ),
-
-        const SizedBox(height: 5),
-
-        Text(
-          content,
-
-          style: TextStyle(
-            color: Colors.grey.shade700,
-            fontSize: 12,
-            height: 1.45,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _bulletSection(String title, List<String> items) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-
-      children: [
-        Text(
-          title,
-
-          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-        ),
-
-        const SizedBox(height: 6),
-
-        ...items.map(
-          (item) => Padding(
-            padding: const EdgeInsets.only(bottom: 5),
-
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-
-              children: [
-                const Text('• ', style: TextStyle(fontWeight: FontWeight.bold)),
-
-                Expanded(
-                  child: Text(
-                    item,
-
-                    style: TextStyle(
-                      color: Colors.grey.shade700,
-                      fontSize: 12,
-                      height: 1.4,
-                    ),
+        const SizedBox(height: 14),
+        _card(
+          title: plant,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 7,
+                ),
+                decoration: BoxDecoration(
+                  color: statusColor.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  status,
+                  style: TextStyle(
+                    color: statusColor,
+                    fontWeight: FontWeight.bold,
                   ),
                 ),
-              ],
-            ),
+              ),
+              const Divider(height: 28),
+              _detailRow(_t('disease', 'Disease'), disease),
+              _detailRow(_t('confidence', 'Confidence'), '$confidence%'),
+              _detailRow(_t('severity', 'Severity'), severity),
+              const SizedBox(height: 10),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: LinearProgressIndicator(
+                  value: confidence / 100,
+                  minHeight: 8,
+                  backgroundColor: Colors.grey.shade200,
+                ),
+              ),
+            ],
           ),
+        ),
+        _sectionCard(
+          _t('observations', 'Observations'),
+          _list(['observations']),
+        ),
+        _sectionCard(
+          _t('possible_causes', 'Possible Causes'),
+          _list(['possibleCauses', 'possible_causes']),
+        ),
+        _sectionCard(_t('treatment', 'Treatment'), _list(['treatment'])),
+        _sectionCard(_t('prevention', 'Prevention'), _list(['prevention'])),
+        _textCard(
+          _t('watering_advice', 'Watering Advice'),
+          _text(['wateringAdvice', 'watering_advice']),
+        ),
+        _textCard(
+          _t('sunlight_advice', 'Sunlight Advice'),
+          _text(['sunlightAdvice', 'sunlight_advice']),
+        ),
+        _sectionCard(
+          _t('recovery_plan', 'Recovery Plan'),
+          _list(['recoveryPlan', 'recovery_plan']),
+        ),
+        _textCard(
+          _t('rescan_after', 'Rescan After'),
+          _text(['rescanAfterDays', 'rescan_after_days'], fallback: ''),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          _t(
+            'ai_diagnosis_disclaimer',
+            'AI analysis is an estimate based on the submitted image, '
+                'not a laboratory diagnosis.',
+          ),
+          style: TextStyle(color: Colors.grey.shade700, fontSize: 12),
         ),
       ],
     );
@@ -962,142 +461,140 @@ class _PlantScannerPageState extends State<PlantScannerPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFFF6FAF5),
+    return AnimatedBuilder(
+      animation: _language,
+      builder: (context, _) {
+        final scanTitle = widget.plantName == null
+            ? _t('scan_your_plant', 'Scan your plant')
+            : '${_t('scan', 'Scan')} ${widget.plantName}';
 
-      appBar: AppBar(
-        title: const Text(
-          'AI Plant Doctor',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-
-        backgroundColor: const Color(0xFFF6FAF5),
-
-        elevation: 0,
-      ),
-
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(20, 10, 20, 35),
-
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-
-          children: [
-            Container(
-              width: double.infinity,
-
+        return Scaffold(
+          backgroundColor: const Color(0xFFF6FAF5),
+          appBar: AppBar(
+            title: Text(_t('plant_scanner', 'Plant Scanner')),
+            backgroundColor: Colors.white,
+            foregroundColor: Colors.green.shade900,
+          ),
+          body: SafeArea(
+            child: SingleChildScrollView(
               padding: const EdgeInsets.all(18),
-
-              decoration: BoxDecoration(
-                color: Colors.green.shade50,
-
-                borderRadius: BorderRadius.circular(20),
-              ),
-
-              child: const Row(
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
-
                 children: [
-                  Text('🤖', style: TextStyle(fontSize: 35)),
-
-                  SizedBox(width: 12),
-
-                  Expanded(
+                  _card(
+                    title: scanTitle,
                     child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-
                       children: [
-                        Text(
-                          'AI Plant Doctor',
-                          style: TextStyle(
-                            fontSize: 17,
-                            fontWeight: FontWeight.bold,
-                          ),
+                        Icon(
+                          Icons.eco_outlined,
+                          size: 54,
+                          color: Colors.green.shade700,
                         ),
-
-                        SizedBox(height: 5),
-
+                        const SizedBox(height: 12),
                         Text(
-                          'Upload a clear plant or leaf photo and let AI check its health.',
+                          _t(
+                            'plant_scanner_description',
+                            'Take a clear photo of your plant or leaf to '
+                                'receive AI-powered identification and '
+                                'care suggestions.',
+                          ),
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(height: 1.5),
+                        ),
+                        const SizedBox(height: 14),
+                        Text(
+                          '${_t('ai_response_language', 'AI response language')}: '
+                          '$_languageName',
+                          textAlign: TextAlign.center,
                           style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey,
-                            height: 1.4,
+                            color: Colors.green.shade800,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
                       ],
                     ),
                   ),
+                  if (selectedImage != null)
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(20),
+                      child: Image.file(
+                        selectedImage!,
+                        width: double.infinity,
+                        height: 260,
+                        fit: BoxFit.cover,
+                      ),
+                    )
+                  else
+                    Container(
+                      width: double.infinity,
+                      height: 190,
+                      decoration: BoxDecoration(
+                        color: Colors.green.shade50,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: Colors.green.shade100),
+                      ),
+                      child: Icon(
+                        Icons.add_a_photo_outlined,
+                        size: 60,
+                        color: Colors.green.shade700,
+                      ),
+                    ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: isAnalyzing ? null : takePhoto,
+                          icon: const Icon(Icons.camera_alt_outlined),
+                          label: Text(_t('camera', 'Camera')),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: isAnalyzing ? null : chooseFromGallery,
+                          icon: const Icon(Icons.photo_library_outlined),
+                          label: Text(_t('gallery', 'Gallery')),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: selectedImage == null || isAnalyzing
+                          ? null
+                          : analyzePlant,
+                      icon: isAnalyzing
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Icon(Icons.auto_awesome),
+                      label: Text(
+                        isAnalyzing
+                            ? _t('analyzing_plant', 'Analyzing plant...')
+                            : _t('analyze_plant', 'Analyze Plant'),
+                      ),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.green.shade700,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 15),
+                      ),
+                    ),
+                  ),
+                  _buildAnalysis(),
                 ],
               ),
             ),
-
-            const SizedBox(height: 22),
-
-            const Text(
-              '1. Select Plant',
-              style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-            ),
-
-            const SizedBox(height: 10),
-
-            _buildPlantSelector(),
-
-            const SizedBox(height: 24),
-
-            const Text(
-              '2. Add Photo',
-              style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-            ),
-
-            const SizedBox(height: 10),
-
-            _buildImageArea(),
-
-            const SizedBox(height: 20),
-
-            _buildAnalyzeButton(),
-
-            if (_loading) ...[
-              const SizedBox(height: 15),
-
-              Center(
-                child: Text(
-                  'AI is examining the plant...',
-                  style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
-                ),
-              ),
-            ],
-
-            if (_analysis != null) ...[
-              const SizedBox(height: 25),
-
-              const Text(
-                '3. Diagnosis',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-              ),
-
-              const SizedBox(height: 10),
-
-              _buildResult(),
-            ],
-
-            const SizedBox(height: 25),
-
-            Text(
-              'Note: AI analysis is an estimate based on visual information and should not replace professional agricultural diagnosis.',
-
-              textAlign: TextAlign.center,
-
-              style: TextStyle(
-                color: Colors.grey.shade600,
-                fontSize: 10,
-                height: 1.4,
-              ),
-            ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }

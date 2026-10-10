@@ -3,8 +3,11 @@ import 'package:urban_farming_ai/main.dart';
 
 void main() {
   testWidgets('Urban Farming AI app loads', (WidgetTester tester) async {
-    await tester.pumpWidget(const UrbanFarmingAI());
+    await tester.pumpWidget(const UrbanFarmingAIApp());
 
-    expect(find.text('Urban Farming AI'), findsOneWidget);
+    // Allow Firebase authentication state to settle.
+    await tester.pump();
+
+    expect(find.byType(UrbanFarmingAIApp), findsOneWidget);
   });
 }

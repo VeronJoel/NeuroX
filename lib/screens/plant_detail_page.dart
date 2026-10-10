@@ -4,6 +4,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
+import '../services/app_language_service.dart';
+import '../services/firestore_service.dart';
 import 'ai_advisor_page.dart';
 import 'plant_diary_page.dart';
 import 'plant_scanner_page.dart';
@@ -21,219 +23,179 @@ class PlantDetailPage extends StatefulWidget {
 class _PlantDetailPageState extends State<PlantDetailPage> {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final FirestoreService _firestoreService = FirestoreService();
+  final AppLanguageService _language = AppLanguageService.instance;
 
   bool _isUpdating = false;
 
-  DocumentReference<Map<String, dynamic>> get _plantRef {
-    final uid = _auth.currentUser!.uid;
+  String _t(String key, String fallback) {
+    final result = _language.translate(key);
+    return result == key ? fallback : result;
+  }
+
+  DocumentReference<Map<String, dynamic>>? get _plantRef {
+    final user = _auth.currentUser;
+    if (user == null) return null;
 
     return _firestore
         .collection('users')
-        .doc(uid)
+        .doc(user.uid)
         .collection('plants')
         .doc(widget.plantId);
   }
 
-  // ============================================================
-  // HELPERS
-  // ============================================================
-
   int _healthValue(dynamic value) {
-    if (value is num) {
-      return value.toInt().clamp(0, 100);
-    }
-
-    return 100;
+    if (value is num) return value.round().clamp(0, 100);
+    return int.tryParse(value?.toString() ?? '')?.clamp(0, 100) ?? 100;
   }
 
   String _stringValue(dynamic value, {String fallback = ''}) {
-    if (value == null) {
-      return fallback;
-    }
-
-    return value.toString();
+    if (value == null) return fallback;
+    final text = value.toString().trim();
+    return text.isEmpty ? fallback : text;
   }
 
   List<String> _stringList(dynamic value) {
     if (value is List) {
       return value
-          .map((item) => item.toString())
-          .where((item) => item.trim().isNotEmpty)
+          .map((item) => item.toString().trim())
+          .where((item) => item.isNotEmpty)
           .toList();
     }
-
     return [];
   }
 
   DateTime? _dateFromValue(dynamic value) {
-    if (value is Timestamp) {
-      return value.toDate();
-    }
-
-    if (value is DateTime) {
-      return value;
-    }
-
+    if (value is Timestamp) return value.toDate();
+    if (value is DateTime) return value;
+    if (value is String) return DateTime.tryParse(value);
     return null;
   }
 
   String _formatDate(DateTime? date) {
-    if (date == null) {
-      return 'Not available';
-    }
-
+    if (date == null) return _t('not_available', 'Not available');
     return '${date.day.toString().padLeft(2, '0')}/'
         '${date.month.toString().padLeft(2, '0')}/'
         '${date.year}';
   }
 
   String _formatDateTime(DateTime? date) {
-    if (date == null) {
-      return 'Not available';
-    }
-
-    return '${date.day.toString().padLeft(2, '0')}/'
-        '${date.month.toString().padLeft(2, '0')}/'
-        '${date.year} '
+    if (date == null) return _t('not_available', 'Not available');
+    return '${_formatDate(date)} '
         '${date.hour.toString().padLeft(2, '0')}:'
         '${date.minute.toString().padLeft(2, '0')}';
   }
 
-  // ============================================================
-  // PHOTO
-  // ============================================================
+  void _showMessage(String message, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Colors.red.shade700 : Colors.green.shade700,
+      ),
+    );
+  }
 
   Widget _buildPlantPhoto(Map<String, dynamic> data) {
     final imageBase64 = data['imageBase64']?.toString() ?? '';
-
-    if (imageBase64.isEmpty) {
-      return Container(
-        height: 250,
-        width: double.infinity,
-
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: [Colors.green.shade100, Colors.green.shade50],
-          ),
-          borderRadius: BorderRadius.circular(24),
-        ),
-
-        child: const Center(child: Text('🌿', style: TextStyle(fontSize: 90))),
-      );
-    }
+    if (imageBase64.isEmpty) return _photoPlaceholder();
 
     try {
-      final bytes = base64Decode(imageBase64);
+      final normalized = imageBase64.contains(',')
+          ? imageBase64.substring(imageBase64.indexOf(',') + 1)
+          : imageBase64;
+      final bytes = base64Decode(normalized);
 
       return ClipRRect(
         borderRadius: BorderRadius.circular(24),
-
         child: Image.memory(
           bytes,
           width: double.infinity,
           height: 250,
           fit: BoxFit.cover,
-
-          errorBuilder: (context, error, stackTrace) {
-            return Container(
-              height: 250,
-              width: double.infinity,
-
-              color: Colors.green.shade50,
-
-              child: const Center(
-                child: Text('🌿', style: TextStyle(fontSize: 90)),
-              ),
-            );
-          },
+          errorBuilder: (_, __, ___) => _photoPlaceholder(),
         ),
       );
-    } catch (e) {
-      return Container(
-        height: 250,
-        width: double.infinity,
-
-        color: Colors.green.shade50,
-
-        child: const Center(child: Text('🌿', style: TextStyle(fontSize: 90))),
-      );
+    } catch (_) {
+      return _photoPlaceholder();
     }
   }
 
-  // ============================================================
-  // HEALTH COLOR
-  // ============================================================
+  Widget _photoPlaceholder() {
+    return Container(
+      width: double.infinity,
+      height: 250,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Colors.green.shade100, Colors.green.shade50],
+        ),
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: const Center(child: Text('🌿', style: TextStyle(fontSize: 90))),
+    );
+  }
 
   Color _healthColor(int health) {
-    if (health >= 80) {
-      return Colors.green;
-    }
-
-    if (health >= 60) {
-      return Colors.orange;
-    }
-
+    if (health >= 80) return Colors.green;
+    if (health >= 60) return Colors.orange;
     return Colors.red;
   }
 
   String _healthStatus(int health) {
-    if (health >= 80) {
-      return 'Healthy';
-    }
-
-    if (health >= 60) {
-      return 'Needs Attention';
-    }
-
-    return 'Critical';
+    if (health >= 80) return _t('healthy', 'Healthy');
+    if (health >= 60) return _t('attention', 'Needs Attention');
+    return _t('critical', 'Critical');
   }
 
-  // ============================================================
-  // WATER PLANT
-  // ============================================================
-
   Future<void> _markWatered(Map<String, dynamic> data) async {
-    setState(() {
-      _isUpdating = true;
-    });
+    if (_isUpdating || _plantRef == null) return;
+
+    setState(() => _isUpdating = true);
 
     try {
       final now = DateTime.now();
+      final intervalValue = data['wateringInterval'];
+      int interval = 2;
 
-      final nextWatering = now.add(const Duration(days: 2));
+      if (intervalValue is num) {
+        interval = intervalValue.toInt();
+      } else {
+        interval = int.tryParse(intervalValue?.toString() ?? '') ?? 2;
+      }
 
-      await _plantRef.update({
+      interval = interval.clamp(1, 30);
+      final nextWatering = now.add(Duration(days: interval));
+
+      await _plantRef!.update({
         'lastWatered': Timestamp.fromDate(now),
         'nextWatering': Timestamp.fromDate(nextWatering),
         'updatedAt': FieldValue.serverTimestamp(),
       });
 
-      if (!mounted) return;
+      try {
+        await _plantRef!.collection('diary').add({
+          'title': 'Plant watered',
+          'note':
+              'Watered the plant. Next watering scheduled '
+              'after $interval day${interval == 1 ? '' : 's'}.',
+          'type': 'Watering',
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+      } catch (e) {
+        debugPrint('Could not save watering diary entry: $e');
+      }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('💧 Plant marked as watered!'),
-          backgroundColor: Colors.green,
-        ),
-      );
+      _showMessage('💧 ${_t('plant_watered', 'Plant marked as watered!')}');
     } catch (e) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not update watering status.')),
+      debugPrint('Watering update failed: $e');
+      _showMessage(
+        _t('watering_update_failed', 'Could not update watering status.'),
+        isError: true,
       );
     } finally {
-      if (mounted) {
-        setState(() {
-          _isUpdating = false;
-        });
-      }
+      if (mounted) setState(() => _isUpdating = false);
     }
   }
-
-  // ============================================================
-  // GROWTH STAGE
-  // ============================================================
 
   Future<void> _changeGrowthStage(String currentStage) async {
     const stages = [
@@ -250,49 +212,37 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
 
     final result = await showDialog<String>(
       context: context,
-
-      builder: (context) {
+      builder: (dialogContext) {
         return StatefulBuilder(
-          builder: (context, setDialogState) {
+          builder: (dialogContext, setDialogState) {
             return AlertDialog(
-              title: const Text('Growth Stage'),
-
+              title: Text(_t('growth_stage', 'Growth Stage')),
               content: DropdownButtonFormField<String>(
-                value: selectedStage,
-
-                decoration: const InputDecoration(
-                  labelText: 'Stage',
-                  border: OutlineInputBorder(),
+                initialValue: selectedStage,
+                decoration: InputDecoration(
+                  labelText: _t('stage', 'Stage'),
+                  border: const OutlineInputBorder(),
                 ),
-
-                items: stages.map((stage) {
-                  return DropdownMenuItem(value: stage, child: Text(stage));
-                }).toList(),
-
+                items: stages
+                    .map(
+                      (stage) =>
+                          DropdownMenuItem(value: stage, child: Text(stage)),
+                    )
+                    .toList(),
                 onChanged: (value) {
-                  if (value == null) {
-                    return;
+                  if (value != null) {
+                    setDialogState(() => selectedStage = value);
                   }
-
-                  setDialogState(() {
-                    selectedStage = value;
-                  });
                 },
               ),
-
               actions: [
                 TextButton(
-                  onPressed: () {
-                    Navigator.pop(context);
-                  },
-                  child: const Text('Cancel'),
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: Text(_t('cancel', 'Cancel')),
                 ),
-
                 ElevatedButton(
-                  onPressed: () {
-                    Navigator.pop(context, selectedStage);
-                  },
-                  child: const Text('Save'),
+                  onPressed: () => Navigator.pop(dialogContext, selectedStage),
+                  child: Text(_t('save', 'Save')),
                 ),
               ],
             );
@@ -301,32 +251,21 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
       },
     );
 
-    if (result == null) {
-      return;
-    }
+    if (result == null || _plantRef == null) return;
 
     try {
-      await _plantRef.update({
+      await _plantRef!.update({
         'growthStage': result,
         'updatedAt': FieldValue.serverTimestamp(),
       });
-
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Growth stage updated.')));
+      _showMessage(_t('growth_stage_updated', 'Growth stage updated.'));
     } catch (e) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not update growth stage.')),
+      _showMessage(
+        _t('growth_stage_update_failed', 'Could not update growth stage.'),
+        isError: true,
       );
     }
   }
-
-  // ============================================================
-  // AI ADVISOR
-  // ============================================================
 
   void _openAIAdvisor(String plantName) {
     Navigator.push(
@@ -338,10 +277,6 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
     );
   }
 
-  // ============================================================
-  // SCANNER
-  // ============================================================
-
   void _openScanner(String plantName) {
     Navigator.push(
       context,
@@ -352,169 +287,136 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
     );
   }
 
-  // ============================================================
-  // DELETE
-  // ============================================================
-
   Future<void> _deletePlant(String plantName) async {
+    if (_isUpdating || _plantRef == null) return;
+
     final confirmed = await showDialog<bool>(
       context: context,
-
-      builder: (context) {
+      builder: (dialogContext) {
         return AlertDialog(
-          title: const Text('Delete Plant?'),
-
+          title: Text(_t('delete_plant', 'Delete Plant?')),
           content: Text(
-            'Are you sure you want to delete '
-            '"$plantName"? This will remove '
-            'its plant record.',
+            '${_t('delete_confirmation_start', 'Are you sure you want to delete')} '
+            '"$plantName"? '
+            '${_t('delete_confirmation_end', 'This will remove its plant record. Its related history may also become inaccessible.')}',
           ),
-
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.pop(context, false);
-              },
-              child: const Text('Cancel'),
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: Text(_t('cancel', 'Cancel')),
             ),
-
             TextButton(
-              onPressed: () {
-                Navigator.pop(context, true);
-              },
-
+              onPressed: () => Navigator.pop(dialogContext, true),
               style: TextButton.styleFrom(foregroundColor: Colors.red),
-
-              child: const Text('Delete'),
+              child: Text(_t('delete', 'Delete')),
             ),
           ],
         );
       },
     );
 
-    if (confirmed != true) {
-      return;
-    }
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _isUpdating = true);
 
     try {
-      await _plantRef.delete();
-
+      await _plantRef!.delete();
       if (!mounted) return;
-
       Navigator.pop(context);
     } catch (e) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Could not delete plant.')));
+      _showMessage(
+        _t('delete_plant_failed', 'Could not delete plant.'),
+        isError: true,
+      );
+    } finally {
+      if (mounted) setState(() => _isUpdating = false);
     }
   }
 
-  // ============================================================
-  // EDIT PLANT
-  // ============================================================
-
   Future<void> _editPlant(Map<String, dynamic> data) async {
+    if (_plantRef == null) return;
+
     final nameController = TextEditingController(
       text: _stringValue(data['name'], fallback: 'My Plant'),
     );
-
     final typeController = TextEditingController(
       text: _stringValue(data['type'], fallback: 'Plant'),
     );
 
     final result = await showDialog<bool>(
       context: context,
-
-      builder: (context) {
+      builder: (dialogContext) {
         return AlertDialog(
-          title: const Text('Edit Plant'),
-
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-
-            children: [
-              TextField(
-                controller: nameController,
-                decoration: const InputDecoration(
-                  labelText: 'Plant name',
-                  border: OutlineInputBorder(),
+          title: Text(_t('edit_plant', 'Edit Plant')),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameController,
+                  decoration: InputDecoration(
+                    labelText: _t('plant_name', 'Plant name'),
+                    border: const OutlineInputBorder(),
+                  ),
                 ),
-              ),
-
-              const SizedBox(height: 15),
-
-              TextField(
-                controller: typeController,
-                decoration: const InputDecoration(
-                  labelText: 'Plant type',
-                  border: OutlineInputBorder(),
+                const SizedBox(height: 15),
+                TextField(
+                  controller: typeController,
+                  decoration: InputDecoration(
+                    labelText: _t('plant_type', 'Plant type'),
+                    border: const OutlineInputBorder(),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
-
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.pop(context, false);
-              },
-              child: const Text('Cancel'),
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: Text(_t('cancel', 'Cancel')),
             ),
-
             ElevatedButton(
-              onPressed: () {
-                Navigator.pop(context, true);
-              },
-              child: const Text('Save'),
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: Text(_t('save', 'Save')),
             ),
           ],
         );
       },
     );
 
-    if (result != true) {
-      nameController.dispose();
-      typeController.dispose();
-      return;
-    }
-
     final name = nameController.text.trim();
-
     final type = typeController.text.trim();
 
     nameController.dispose();
     typeController.dispose();
 
-    if (name.isEmpty || type.isEmpty) {
+    if (result != true || name.isEmpty || type.isEmpty) {
+      if (result == true) {
+        _showMessage(
+          _t(
+            'plant_name_type_required',
+            'Plant name and type cannot be empty.',
+          ),
+          isError: true,
+        );
+      }
       return;
     }
 
     try {
-      await _plantRef.update({
+      await _plantRef!.update({
         'name': name,
         'type': type,
         'updatedAt': FieldValue.serverTimestamp(),
       });
-
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Plant details updated.')));
+      _showMessage(_t('plant_details_updated', 'Plant details updated.'));
     } catch (e) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Could not update plant.')));
+      _showMessage(
+        _t('plant_update_failed', 'Could not update plant.'),
+        isError: true,
+      );
     }
   }
-
-  // ============================================================
-  // ACTION BUTTON
-  // ============================================================
 
   Widget _actionButton({
     required IconData icon,
@@ -527,18 +429,12 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
     return Expanded(
       child: OutlinedButton.icon(
         onPressed: _isUpdating ? null : onPressed,
-
         icon: Icon(icon, size: 19),
-
         label: Text(label, textAlign: TextAlign.center),
-
         style: OutlinedButton.styleFrom(
           foregroundColor: buttonColor,
-
-          side: BorderSide(color: buttonColor.withOpacity(0.35)),
-
+          side: BorderSide(color: buttonColor.withValues(alpha: 0.35)),
           padding: const EdgeInsets.symmetric(vertical: 13),
-
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(14),
           ),
@@ -547,10 +443,6 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
     );
   }
 
-  // ============================================================
-  // INFORMATION CARD
-  // ============================================================
-
   Widget _infoCard({
     required String title,
     required Widget child,
@@ -558,30 +450,21 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
   }) {
     return Container(
       width: double.infinity,
-
       margin: const EdgeInsets.only(bottom: 15),
-
       padding: const EdgeInsets.all(18),
-
       decoration: BoxDecoration(
         color: background ?? Colors.white,
-
         borderRadius: BorderRadius.circular(20),
-
         border: Border.all(color: Colors.green.shade100),
       ),
-
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
-
         children: [
           Text(
             title,
             style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
           ),
-
           const SizedBox(height: 12),
-
           child,
         ],
       ),
@@ -591,24 +474,20 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
   Widget _bulletList(List<String> items) {
     if (items.isEmpty) {
       return Text(
-        'No information available yet.',
+        _t('no_information_available', 'No information available yet.'),
         style: TextStyle(color: Colors.grey.shade600),
       );
     }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
-
       children: items.map((item) {
         return Padding(
           padding: const EdgeInsets.only(bottom: 8),
-
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
-
             children: [
               const Text('• ', style: TextStyle(fontWeight: FontWeight.bold)),
-
               Expanded(child: Text(item)),
             ],
           ),
@@ -617,673 +496,524 @@ class _PlantDetailPageState extends State<PlantDetailPage> {
     );
   }
 
-  // ============================================================
-  // BUILD
-  // ============================================================
+  Widget _detailRow(String title, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 125,
+            child: Text(
+              title,
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              textAlign: TextAlign.right,
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final user = _auth.currentUser;
+    final plantRef = _plantRef;
 
-    if (user == null) {
-      return const Scaffold(body: Center(child: Text('Please log in again.')));
+    if (user == null || plantRef == null) {
+      return Scaffold(
+        body: Center(child: Text(_t('login_again', 'Please log in again.'))),
+      );
     }
 
-    return Scaffold(
-      backgroundColor: const Color(0xFFF6FAF5),
+    return AnimatedBuilder(
+      animation: _language,
+      builder: (context, child) {
+        return Scaffold(
+          backgroundColor: const Color(0xFFF6FAF5),
+          appBar: AppBar(
+            title: Text(
+              _t('plant_details', 'Plant Details'),
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            backgroundColor: const Color(0xFFF6FAF5),
+            elevation: 0,
+            actions: [
+              StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                stream: plantRef.snapshots(),
+                builder: (context, snapshot) {
+                  final data = snapshot.data?.data();
+                  if (data == null) return const SizedBox.shrink();
 
-      appBar: AppBar(
-        title: const Text(
-          'Plant Details',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-
-        backgroundColor: Colors.transparent,
-
-        elevation: 0,
-
-        actions: [
-          StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-            stream: _plantRef.snapshots(),
-
-            builder: (context, snapshot) {
-              final data = snapshot.data?.data();
-
-              if (data == null) {
-                return const SizedBox.shrink();
-              }
-
-              return PopupMenuButton<String>(
-                onSelected: (value) {
-                  if (value == 'edit') {
-                    _editPlant(data);
-                  }
-
-                  if (value == 'delete') {
-                    _deletePlant(
-                      _stringValue(data['name'], fallback: 'this plant'),
-                    );
-                  }
-                },
-
-                itemBuilder: (context) => const [
-                  PopupMenuItem(
-                    value: 'edit',
-                    child: Row(
-                      children: [
-                        Icon(Icons.edit_outlined),
-                        SizedBox(width: 10),
-                        Text('Edit'),
-                      ],
-                    ),
-                  ),
-
-                  PopupMenuItem(
-                    value: 'delete',
-                    child: Row(
-                      children: [
-                        Icon(Icons.delete_outline, color: Colors.red),
-                        SizedBox(width: 10),
-                        Text('Delete', style: TextStyle(color: Colors.red)),
-                      ],
-                    ),
-                  ),
-                ],
-              );
-            },
-          ),
-        ],
-      ),
-
-      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: _plantRef.snapshots(),
-
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
-
-          if (snapshot.hasError) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(25),
-                child: Text(
-                  'Unable to load this plant.\n\n'
-                  '${snapshot.error}',
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            );
-          }
-
-          if (!snapshot.hasData || !snapshot.data!.exists) {
-            return const Center(child: Text('Plant not found.'));
-          }
-
-          final data = snapshot.data!.data()!;
-
-          final plantName = _stringValue(data['name'], fallback: 'My Plant');
-
-          final plantType = _stringValue(data['type'], fallback: 'Plant');
-
-          final health = _healthValue(data['healthScore']);
-
-          final disease = _stringValue(
-            data['diseaseStatus'],
-            fallback: 'Healthy',
-          );
-
-          final status = _stringValue(
-            data['status'],
-            fallback: _healthStatus(health),
-          );
-
-          final growthStage = _stringValue(
-            data['growthStage'],
-            fallback: 'Seedling',
-          );
-
-          final plantedDate = _dateFromValue(
-            data['plantedDate'] ?? data['plantingDate'],
-          );
-
-          final lastWatered = _dateFromValue(data['lastWatered']);
-
-          final nextWatering = _dateFromValue(data['nextWatering']);
-
-          final lastScanAt = _dateFromValue(data['lastScanAt']);
-
-          final observations = _stringList(data['observations']);
-
-          final causes = _stringList(data['possibleCauses']);
-
-          final treatment = _stringList(data['treatment']);
-
-          final prevention = _stringList(data['prevention']);
-
-          final recoveryPlan = _stringList(data['recoveryPlan']);
-
-          final wateringAdvice = _stringValue(
-            data['wateringAdvice'],
-            fallback: 'No watering advice available yet.',
-          );
-
-          final sunlightAdvice = _stringValue(
-            data['sunlightAdvice'],
-            fallback: 'No sunlight advice available yet.',
-          );
-
-          final healthColor = _healthColor(health);
-
-          return RefreshIndicator(
-            onRefresh: () async {
-              setState(() {});
-            },
-
-            child: SingleChildScrollView(
-              physics: const AlwaysScrollableScrollPhysics(),
-
-              padding: const EdgeInsets.fromLTRB(20, 5, 20, 110),
-
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-
-                children: [
-                  // ==================================================
-                  // PHOTO
-                  // ==================================================
-
-                  _buildPlantPhoto(data),
-
-                  const SizedBox(height: 18),
-
-                  // ==================================================
-                  // NAME
-                  // ==================================================
-                  Text(
-                    plantName,
-                    style: const TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-
-                  const SizedBox(height: 5),
-
-                  Text(
-                    plantType,
-                    style: TextStyle(color: Colors.grey.shade600, fontSize: 15),
-                  ),
-
-                  const SizedBox(height: 16),
-
-                  // ==================================================
-                  // HEALTH CARD
-                  // ==================================================
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(20),
-
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-
-                      borderRadius: BorderRadius.circular(22),
-
-                      border: Border.all(color: healthColor.withOpacity(0.25)),
-                    ),
-
-                    child: Column(
-                      children: [
-                        Row(
+                  return PopupMenuButton<String>(
+                    onSelected: (value) {
+                      if (value == 'edit') {
+                        _editPlant(data);
+                      } else if (value == 'delete') {
+                        _deletePlant(
+                          _stringValue(data['name'], fallback: 'this plant'),
+                        );
+                      }
+                    },
+                    itemBuilder: (context) => [
+                      PopupMenuItem(
+                        value: 'edit',
+                        child: Row(
                           children: [
-                            SizedBox(
-                              width: 105,
-                              height: 105,
-
-                              child: Stack(
-                                alignment: Alignment.center,
-
-                                children: [
-                                  SizedBox(
-                                    width: 105,
-                                    height: 105,
-
-                                    child: CircularProgressIndicator(
-                                      value: health / 100,
-
-                                      strokeWidth: 10,
-
-                                      backgroundColor: Colors.grey.shade200,
-
-                                      color: healthColor,
-                                    ),
-                                  ),
-
-                                  Column(
-                                    mainAxisSize: MainAxisSize.min,
-
-                                    children: [
-                                      Text(
-                                        '$health',
-                                        style: TextStyle(
-                                          fontSize: 27,
-                                          fontWeight: FontWeight.bold,
-                                          color: healthColor,
-                                        ),
-                                      ),
-
-                                      Text(
-                                        '/100',
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          color: Colors.grey.shade600,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                            ),
-
-                            const SizedBox(width: 20),
-
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-
-                                children: [
-                                  Text(
-                                    _healthStatus(health),
-                                    style: TextStyle(
-                                      fontSize: 21,
-                                      fontWeight: FontWeight.bold,
-                                      color: healthColor,
-                                    ),
-                                  ),
-
-                                  const SizedBox(height: 7),
-
-                                  Text(
-                                    status,
-                                    style: TextStyle(
-                                      color: Colors.grey.shade700,
-                                    ),
-                                  ),
-
-                                  const SizedBox(height: 7),
-
-                                  Text(
-                                    'Disease: $disease',
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ],
-                              ),
+                            const Icon(Icons.edit_outlined),
+                            const SizedBox(width: 10),
+                            Text(_t('edit', 'Edit')),
+                          ],
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'delete',
+                        child: Row(
+                          children: [
+                            const Icon(Icons.delete_outline, color: Colors.red),
+                            const SizedBox(width: 10),
+                            Text(
+                              _t('delete', 'Delete'),
+                              style: const TextStyle(color: Colors.red),
                             ),
                           ],
                         ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ],
+          ),
+          body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+            stream: plantRef.snapshots(),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(child: CircularProgressIndicator());
+              }
 
-                        const SizedBox(height: 20),
+              if (snapshot.hasError) {
+                return Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(25),
+                    child: Text(
+                      '${_t('unable_to_load_plant', 'Unable to load this plant.')}\n\n${snapshot.error}',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                );
+              }
 
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(13),
+              if (!snapshot.hasData || !snapshot.data!.exists) {
+                return Center(
+                  child: Text(_t('plant_not_found', 'Plant not found.')),
+                );
+              }
 
-                          decoration: BoxDecoration(
-                            color: healthColor.withOpacity(0.08),
+              final data = snapshot.data!.data()!;
+              final plantName = _stringValue(
+                data['name'],
+                fallback: 'My Plant',
+              );
+              final plantType = _stringValue(data['type'], fallback: 'Plant');
+              final health = _healthValue(
+                data['healthScore'] ?? data['health'],
+              );
+              final disease = _stringValue(
+                data['diseaseStatus'],
+                fallback: 'Healthy',
+              );
+              final status = _stringValue(
+                data['status'],
+                fallback: _healthStatus(health),
+              );
+              final growthStage = _stringValue(
+                data['growthStage'],
+                fallback: 'Seedling',
+              );
 
-                            borderRadius: BorderRadius.circular(14),
+              final plantedDate = _dateFromValue(
+                data['plantedDate'] ?? data['plantingDate'],
+              );
+              final lastWatered = _dateFromValue(data['lastWatered']);
+              final nextWatering = _dateFromValue(data['nextWatering']);
+              final lastScanAt = _dateFromValue(data['lastScanAt']);
+
+              final observations = _stringList(data['observations']);
+              final causes = _stringList(data['possibleCauses']);
+              final treatment = _stringList(data['treatment']);
+              final prevention = _stringList(data['prevention']);
+              final recoveryPlan = _stringList(data['recoveryPlan']);
+
+              final wateringAdvice = _stringValue(
+                data['wateringAdvice'],
+                fallback: 'No watering advice available yet.',
+              );
+              final sunlightAdvice = _stringValue(
+                data['sunlightAdvice'],
+                fallback: 'No sunlight advice available yet.',
+              );
+
+              final healthColor = _healthColor(health);
+
+              return SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(20, 5, 20, 110),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildPlantPhoto(data),
+                    const SizedBox(height: 18),
+                    Text(
+                      plantName,
+                      style: const TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 5),
+                    Text(
+                      plantType,
+                      style: TextStyle(
+                        color: Colors.grey.shade600,
+                        fontSize: 15,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(20),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(22),
+                        border: Border.all(
+                          color: healthColor.withValues(alpha: 0.25),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            children: [
+                              SizedBox(
+                                width: 105,
+                                height: 105,
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    SizedBox(
+                                      width: 105,
+                                      height: 105,
+                                      child: CircularProgressIndicator(
+                                        value: health / 100,
+                                        strokeWidth: 10,
+                                        backgroundColor: Colors.grey.shade200,
+                                        color: healthColor,
+                                      ),
+                                    ),
+                                    Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(
+                                          '$health',
+                                          style: TextStyle(
+                                            fontSize: 27,
+                                            fontWeight: FontWeight.bold,
+                                            color: healthColor,
+                                          ),
+                                        ),
+                                        Text(
+                                          '/100',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            color: Colors.grey.shade600,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 20),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _healthStatus(health),
+                                      style: TextStyle(
+                                        fontSize: 21,
+                                        fontWeight: FontWeight.bold,
+                                        color: healthColor,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 7),
+                                    Text(
+                                      status,
+                                      style: TextStyle(
+                                        color: Colors.grey.shade700,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 7),
+                                    Text(
+                                      '${_t('disease', 'Disease')}: $disease',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
                           ),
-
-                          child: Text(
-                            lastScanAt == null
-                                ? 'No AI scan has been recorded yet.'
-                                : 'Last AI scan: '
-                                      '${_formatDateTime(lastScanAt)}',
-                            style: TextStyle(
-                              color: Colors.grey.shade700,
-                              fontSize: 13,
+                          const SizedBox(height: 20),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(13),
+                            decoration: BoxDecoration(
+                              color: healthColor.withValues(alpha: 0.08),
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: Text(
+                              lastScanAt == null
+                                  ? _t(
+                                      'no_ai_scan',
+                                      'No AI scan has been recorded yet.',
+                                    )
+                                  : '${_t('last_ai_scan', 'Last AI scan')}: ${_formatDateTime(lastScanAt)}',
+                              style: TextStyle(
+                                color: Colors.grey.shade700,
+                                fontSize: 13,
+                              ),
                             ),
                           ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 15),
+
+                    Row(
+                      children: [
+                        _actionButton(
+                          icon: Icons.water_drop,
+                          label: _t('watered', 'Watered'),
+                          onPressed: () => _markWatered(data),
+                          color: Colors.blue,
+                        ),
+                        const SizedBox(width: 10),
+                        _actionButton(
+                          icon: Icons.camera_alt,
+                          label: _t('scan_again', 'Scan Again'),
+                          onPressed: () => _openScanner(plantName),
                         ),
                       ],
                     ),
-                  ),
-
-                  const SizedBox(height: 15),
-
-                  // ==================================================
-                  // QUICK ACTIONS
-                  // ==================================================
-                  Row(
-                    children: [
-                      _actionButton(
-                        icon: Icons.water_drop,
-                        label: 'Watered',
-                        onPressed: () => _markWatered(data),
-                        color: Colors.blue,
-                      ),
-
-                      const SizedBox(width: 10),
-
-                      _actionButton(
-                        icon: Icons.camera_alt,
-                        label: 'Scan Again',
-                        onPressed: () => _openScanner(plantName),
-                      ),
-                    ],
-                  ),
-
-                  const SizedBox(height: 10),
-
-                  Row(
-                    children: [
-                      _actionButton(
-                        icon: Icons.auto_awesome,
-                        label: 'AI Advisor',
-                        onPressed: () => _openAIAdvisor(plantName),
-                      ),
-
-                      const SizedBox(width: 10),
-
-                      _actionButton(
-                        icon: Icons.menu_book,
-                        label: 'Diary',
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        _actionButton(
+                          icon: Icons.auto_awesome,
+                          label: _t('ai_advisor', 'AI Advisor'),
+                          onPressed: () => _openAIAdvisor(plantName),
+                        ),
+                        const SizedBox(width: 10),
+                        _actionButton(
+                          icon: Icons.menu_book,
+                          label: _t('diary', 'Diary'),
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => PlantDiaryPage(
+                                  plantId: widget.plantId,
+                                  plantName: plantName,
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
                         onPressed: () {
                           Navigator.push(
                             context,
                             MaterialPageRoute(
-                              builder: (_) => PlantDiaryPage(
+                              builder: (_) => ScanHistoryPage(
                                 plantId: widget.plantId,
                                 plantName: plantName,
                               ),
                             ),
                           );
                         },
-                      ),
-                    ],
-                  ),
-
-                  const SizedBox(height: 10),
-
-                  SizedBox(
-                    width: double.infinity,
-
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => ScanHistoryPage(
-                              plantId: widget.plantId,
-                              plantName: plantName,
-                            ),
+                        icon: const Icon(Icons.history),
+                        label: Text(
+                          _t('view_scan_history', 'View Scan History'),
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.green.shade700,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
                           ),
-                        );
-                      },
-
-                      icon: const Icon(Icons.history),
-
-                      label: const Text('View Scan History'),
-
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.green.shade700,
-
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
                         ),
                       ),
                     ),
-                  ),
+                    const SizedBox(height: 25),
 
-                  const SizedBox(height: 25),
-
-                  // ==================================================
-                  // PLANT INFORMATION
-                  // ==================================================
-                  _infoCard(
-                    title: 'Plant Information',
-                    child: Column(
-                      children: [
-                        _detailRow('Planting date', _formatDate(plantedDate)),
-
-                        _detailRow('Growth stage', growthStage),
-
-                        _detailRow(
-                          'Last watered',
-                          _formatDateTime(lastWatered),
-                        ),
-
-                        _detailRow(
-                          'Next watering',
-                          _formatDateTime(nextWatering),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  // ==================================================
-                  // GROWTH STAGE
-                  // ==================================================
-                  SizedBox(
-                    width: double.infinity,
-
-                    child: OutlinedButton.icon(
-                      onPressed: () => _changeGrowthStage(growthStage),
-
-                      icon: const Icon(Icons.eco),
-
-                      label: Text(
-                        'Change Growth Stage '
-                        '($growthStage)',
-                      ),
-
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.green.shade700,
-
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                      ),
-                    ),
-                  ),
-
-                  const SizedBox(height: 25),
-
-                  // ==================================================
-                  // AI RECOMMENDATION
-                  // ==================================================
-                  _infoCard(
-                    title: '🤖 AI Recommendation',
-                    background: Colors.green.shade50,
-
-                    child: Text(
-                      _stringValue(
-                        data['aiRecommendation'],
-                        fallback: 'Run an AI scan or ask the AI Advisor for a personalized recommendation.',
-                      ),
-
-                      style: const TextStyle(height: 1.5),
-                    ),
-                  ),
-
-                  // ==================================================
-                  // OBSERVATIONS
-                  // ==================================================
-                  _infoCard(
-                    title: '🔍 AI Observations',
-                    child: _bulletList(observations),
-                  ),
-
-                  // ==================================================
-                  // POSSIBLE CAUSES
-                  // ==================================================
-                  _infoCard(
-                    title: '🧩 Possible Causes',
-                    child: _bulletList(causes),
-                  ),
-
-                  // ==================================================
-                  // TREATMENT
-                  // ==================================================
-                  _infoCard(
-                    title: '🩺 Treatment',
-                    child: _bulletList(treatment),
-                  ),
-
-                  // ==================================================
-                  // PREVENTION
-                  // ==================================================
-                  _infoCard(
-                    title: '🛡️ Prevention',
-                    child: _bulletList(prevention),
-                  ),
-
-                  // ==================================================
-                  // WATERING
-                  // ==================================================
-                  _infoCard(
-                    title: '💧 Watering Advice',
-                    child: Text(
-                      wateringAdvice,
-                      style: const TextStyle(height: 1.5),
-                    ),
-                  ),
-
-                  // ==================================================
-                  // SUNLIGHT
-                  // ==================================================
-                  _infoCard(
-                    title: '☀️ Sunlight Advice',
-                    child: Text(
-                      sunlightAdvice,
-                      style: const TextStyle(height: 1.5),
-                    ),
-                  ),
-
-                  // ==================================================
-                  // RECOVERY PLAN
-                  // ==================================================
-                  if (recoveryPlan.isNotEmpty)
                     _infoCard(
-                      title: '🌱 Recovery Plan',
-                      background: Colors.orange.shade50,
-
-                      child: _bulletList(recoveryPlan),
+                      title: _t('plant_information', 'Plant Information'),
+                      child: Column(
+                        children: [
+                          _detailRow(
+                            _t('planting_date', 'Planting date'),
+                            _formatDate(plantedDate),
+                          ),
+                          _detailRow(
+                            _t('growth_stage', 'Growth stage'),
+                            growthStage,
+                          ),
+                          _detailRow(
+                            _t('last_watered', 'Last watered'),
+                            _formatDateTime(lastWatered),
+                          ),
+                          _detailRow(
+                            _t('next_watering', 'Next watering'),
+                            _formatDateTime(nextWatering),
+                          ),
+                        ],
+                      ),
                     ),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: () => _changeGrowthStage(growthStage),
+                        icon: const Icon(Icons.eco),
+                        label: Text(
+                          '${_t('change_growth_stage', 'Change Growth Stage')} ($growthStage)',
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.green.shade700,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 25),
 
-                  // ==================================================
-                  // RESCAN
-                  // ==================================================
-                  if (data['needsRescan'] == true)
                     _infoCard(
-                      title: '🔄 Recommended Rescan',
-
-                      background: Colors.orange.shade50,
-
+                      title:
+                          '🤖 ${_t('ai_recommendation', 'AI Recommendation')}',
+                      background: Colors.green.shade50,
                       child: Text(
-                        'The AI recommends scanning this plant again after '
-                        '${data['rescanAfterDays'] ?? 0} days.',
+                        _stringValue(
+                          data['aiRecommendation'],
+                          fallback:
+                              'Run an AI scan or ask the AI Advisor '
+                              'for personalized recommendations.',
+                        ),
                         style: const TextStyle(height: 1.5),
                       ),
                     ),
-
-                  // ==================================================
-                  // DELETE
-                  // ==================================================
-                  const SizedBox(height: 5),
-
-                  SizedBox(
-                    width: double.infinity,
-
-                    child: TextButton.icon(
-                      onPressed: _isUpdating
-                          ? null
-                          : () => _deletePlant(plantName),
-
-                      icon: const Icon(Icons.delete_outline),
-
-                      label: const Text('Delete Plant'),
-
-                      style: TextButton.styleFrom(
-                        foregroundColor: Colors.red,
-                        padding: const EdgeInsets.symmetric(vertical: 15),
+                    _infoCard(
+                      title: '🔍 ${_t('ai_observations', 'AI Observations')}',
+                      child: _bulletList(observations),
+                    ),
+                    _infoCard(
+                      title: '🧩 ${_t('possible_causes', 'Possible Causes')}',
+                      child: _bulletList(causes),
+                    ),
+                    _infoCard(
+                      title: '🩺 ${_t('treatment', 'Treatment')}',
+                      child: _bulletList(treatment),
+                    ),
+                    _infoCard(
+                      title: '🛡️ ${_t('prevention', 'Prevention')}',
+                      child: _bulletList(prevention),
+                    ),
+                    _infoCard(
+                      title: '💧 ${_t('watering_advice', 'Watering Advice')}',
+                      child: Text(
+                        wateringAdvice,
+                        style: const TextStyle(height: 1.5),
                       ),
                     ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-
-      // ============================================================
-      // FLOATING WATER BUTTON
-      // ============================================================
-      floatingActionButton:
-          StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-            stream: _plantRef.snapshots(),
-
-            builder: (context, snapshot) {
-              if (!snapshot.hasData || !snapshot.data!.exists) {
-                return const SizedBox.shrink();
-              }
-
-              final data = snapshot.data!.data()!;
-
-              return FloatingActionButton.extended(
-                onPressed: _isUpdating ? null : () => _markWatered(data),
-
-                backgroundColor: Colors.blue.shade600,
-
-                foregroundColor: Colors.white,
-
-                icon: const Icon(Icons.water_drop),
-
-                label: const Text('Mark Watered'),
+                    _infoCard(
+                      title: '☀️ ${_t('sunlight_advice', 'Sunlight Advice')}',
+                      child: Text(
+                        sunlightAdvice,
+                        style: const TextStyle(height: 1.5),
+                      ),
+                    ),
+                    if (recoveryPlan.isNotEmpty)
+                      _infoCard(
+                        title: '🌱 ${_t('recovery_plan', 'Recovery Plan')}',
+                        background: Colors.orange.shade50,
+                        child: _bulletList(recoveryPlan),
+                      ),
+                    if (data['needsRescan'] == true)
+                      _infoCard(
+                        title:
+                            '🔄 ${_t('recommended_rescan', 'Recommended Rescan')}',
+                        background: Colors.orange.shade50,
+                        child: Text(
+                          '${_t('ai_recommends_rescan', 'The AI recommends scanning this plant again after')} '
+                          '${data['rescanAfterDays'] ?? 0} '
+                          '${_t('days', 'days')}.',
+                          style: const TextStyle(height: 1.5),
+                        ),
+                      ),
+                    const SizedBox(height: 5),
+                    SizedBox(
+                      width: double.infinity,
+                      child: TextButton.icon(
+                        onPressed: _isUpdating
+                            ? null
+                            : () => _deletePlant(plantName),
+                        icon: const Icon(Icons.delete_outline),
+                        label: Text(_t('delete_plant', 'Delete Plant')),
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.red,
+                          padding: const EdgeInsets.symmetric(vertical: 15),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               );
             },
           ),
-    );
-  }
+          floatingActionButton:
+              StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                stream: plantRef.snapshots(),
+                builder: (context, snapshot) {
+                  if (!snapshot.hasData || !snapshot.data!.exists) {
+                    return const SizedBox.shrink();
+                  }
 
-  // ============================================================
-  // DETAIL ROW
-  // ============================================================
-
-  Widget _detailRow(String title, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-
-        children: [
-          SizedBox(
-            width: 125,
-
-            child: Text(
-              title,
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
-            ),
-          ),
-
-          Expanded(
-            child: Text(
-              value,
-              textAlign: TextAlign.right,
-
-              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
-            ),
-          ),
-        ],
-      ),
+                  return FloatingActionButton.extended(
+                    onPressed: _isUpdating
+                        ? null
+                        : () => _markWatered(snapshot.data!.data()!),
+                    backgroundColor: Colors.blue.shade600,
+                    foregroundColor: Colors.white,
+                    icon: const Icon(Icons.water_drop),
+                    label: Text(_t('mark_watered', 'Mark Watered')),
+                  );
+                },
+              ),
+        );
+      },
     );
   }
 }
